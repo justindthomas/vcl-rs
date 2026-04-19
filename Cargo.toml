@@ -1,0 +1,17 @@
+[package]
+name = "vcl-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Async Rust wrapper for VPP's VCL (VPP Communications Library)"
+license = "MPL-2.0"
+authors = ["Justin Thomas"]
+
+[dependencies]
+tokio = { version = "1", features = ["net", "io-util", "sync", "time", "macros", "rt"] }
+thiserror = "1"
+tracing = "0.1"
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = "0.3"
