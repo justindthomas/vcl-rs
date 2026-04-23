@@ -11,6 +11,7 @@
 use std::os::raw::{c_char, c_int, c_void};
 
 pub const VPPCOM_PROTO_TCP: u8 = 0;
+pub const VPPCOM_PROTO_UDP: u8 = 1;
 
 /// Endpoint descriptor passed to bind/connect/accept.
 #[repr(C)]
@@ -91,6 +92,22 @@ extern "C" {
     // --- Data I/O ---
     pub fn vppcom_session_read(session_handle: u32, buf: *mut c_void, n: usize) -> c_int;
     pub fn vppcom_session_write(session_handle: u32, buf: *mut c_void, n: usize) -> c_int;
+
+    // --- Datagram I/O (UDP) ---
+    pub fn vppcom_session_sendto(
+        session_handle: u32,
+        buf: *mut c_void,
+        n: u32,
+        flags: c_int,
+        ep: *mut vppcom_endpt_t,
+    ) -> c_int;
+    pub fn vppcom_session_recvfrom(
+        session_handle: u32,
+        buf: *mut c_void,
+        n: u32,
+        flags: c_int,
+        ep: *mut vppcom_endpt_t,
+    ) -> c_int;
 
     // --- Session attributes ---
     pub fn vppcom_session_attr(

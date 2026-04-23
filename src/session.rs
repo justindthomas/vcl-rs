@@ -20,6 +20,14 @@ impl SessionHandle {
         Ok(SessionHandle(rc as u32))
     }
 
+    pub fn create_udp(nonblocking: bool) -> Result<Self> {
+        let rc = unsafe { ffi::vppcom_session_create(ffi::VPPCOM_PROTO_UDP, nonblocking as u8) };
+        if rc < 0 {
+            return Err(VclError::from_rc(rc));
+        }
+        Ok(SessionHandle(rc as u32))
+    }
+
     pub fn close(&self) -> Result<()> {
         let rc = unsafe { ffi::vppcom_session_close(self.0) };
         if rc < 0 {
@@ -81,6 +89,52 @@ impl SessionHandle {
     pub fn write(&self, buf: &[u8]) -> Result<usize> {
         let rc =
             unsafe { ffi::vppcom_session_write(self.0, buf.as_ptr() as *mut _, buf.len()) };
+        if rc < 0 {
+            return Err(VclError::from_rc(rc));
+        }
+        Ok(rc as usize)
+    }
+
+    /// UDP receive. Returns (bytes_received, peer_addr).
+    ///
+    /// One call yields one datagram — partial reads never happen for UDP.
+    /// VCL fills `ep` with the sender's address; we copy it out before
+    /// the endpoint goes out of scope.
+    pub fn recvfrom(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
+        let mut ip_buf = [0u8; 16];
+        let mut ep = ffi::vppcom_endpt_t {
+            ip: ip_buf.as_mut_ptr(),
+            ..Default::default()
+        };
+        let rc = unsafe {
+            ffi::vppcom_session_recvfrom(
+                self.0,
+                buf.as_mut_ptr() as *mut _,
+                buf.len() as u32,
+                0,
+                &mut ep,
+            )
+        };
+        if rc < 0 {
+            return Err(VclError::from_rc(rc));
+        }
+        let addr = addr_from_endpoint(&ep, &ip_buf);
+        Ok((rc as usize, addr))
+    }
+
+    /// UDP send. Returns bytes written.
+    pub fn sendto(&self, buf: &[u8], dst: SocketAddr) -> Result<usize> {
+        let mut ip_buf = [0u8; 16];
+        let mut ep = endpoint_into_buf(dst, &mut ip_buf);
+        let rc = unsafe {
+            ffi::vppcom_session_sendto(
+                self.0,
+                buf.as_ptr() as *mut _,
+                buf.len() as u32,
+                0,
+                &mut ep,
+            )
+        };
         if rc < 0 {
             return Err(VclError::from_rc(rc));
         }
@@ -176,6 +230,33 @@ pub fn endpoint_from_addr(addr: SocketAddr) -> ffi::vppcom_endpt_t {
         unused: 0,
         is_ip4,
         ip: ip_ptr,
+        port: addr.port().to_be(),
+        unused2: 0,
+        app_tlv_len: 0,
+        app_tlvs: std::ptr::null_mut(),
+    }
+}
+
+/// Build a `vppcom_endpt_t` that borrows IP bytes from a caller-owned
+/// 16-byte buffer. Non-leaking — use this for hot-path sends (UDP
+/// `sendto`) where the original `endpoint_from_addr` would allocate
+/// once per call.
+pub fn endpoint_into_buf(addr: SocketAddr, ip_buf: &mut [u8; 16]) -> ffi::vppcom_endpt_t {
+    let is_ip4 = match addr.ip() {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            ip_buf[..4].copy_from_slice(&octets);
+            1u8
+        }
+        IpAddr::V6(v6) => {
+            ip_buf.copy_from_slice(&v6.octets());
+            0u8
+        }
+    };
+    ffi::vppcom_endpt_t {
+        unused: 0,
+        is_ip4,
+        ip: ip_buf.as_mut_ptr(),
         port: addr.port().to_be(),
         unused2: 0,
         app_tlv_len: 0,

@@ -71,6 +71,7 @@
 pub mod ffi;
 
 pub mod app;
+pub mod dgram;
 pub mod error;
 pub mod listener;
 pub mod reactor;
@@ -78,6 +79,7 @@ pub mod session; // pub for endpoint_from_addr used by VclTransport's I/O thread
 pub mod stream;
 
 pub use app::VclApp;
+pub use dgram::VclDgramSocket;
 pub use listener::VclListener;
 pub use reactor::VclReactor;
 pub use stream::VclStream;
