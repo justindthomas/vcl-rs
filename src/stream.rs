@@ -24,7 +24,7 @@ use crate::error::{Result, VclError};
 use crate::reactor::VclReactor;
 use crate::session::SessionHandle;
 
-type ReactorWait = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+type ReactorWait = Pin<Box<dyn Future<Output = Result<()>> + Send + Sync>>;
 
 pub struct VclStream {
     handle: SessionHandle,
