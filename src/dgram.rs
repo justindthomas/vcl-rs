@@ -145,6 +145,7 @@ impl VclDgramSocket {
 /// without the length prefix.
 pub fn query_tcp_dns_sync(
     peer: SocketAddr,
+    source: Option<std::net::IpAddr>,
     query: &[u8],
     timeout: Duration,
 ) -> Result<Vec<u8>> {
@@ -153,6 +154,37 @@ pub fn query_tcp_dns_sync(
     }
 
     let handle = SessionHandle::create_tcp(true)?;
+    // Bind a source-IP-with-ephemeral-port BEFORE connect when the
+    // caller specified one. Connect() will then preserve it. Without
+    // this VPP picks (or fails to pick) a source via FIB lookup —
+    // which works on most setups but emits packets with src=0.0.0.0
+    // on some (multi-interface, no default-route-to-peer, etc.).
+    if let Some(ip) = source {
+        if ip.is_ipv4() != peer.is_ipv4() {
+            return Err(VclError::Api(
+                format!("source IP family ({ip}) doesn't match peer ({peer})"),
+                -1,
+            ));
+        }
+        use rand::Rng;
+        const LOW: u16 = 32768;
+        const HIGH: u16 = 60999;
+        let mut rng = rand::thread_rng();
+        let mut bound = false;
+        for _ in 0..8 {
+            let port: u16 = rng.gen_range(LOW..=HIGH);
+            if handle.bind(SocketAddr::new(ip, port)).is_ok() {
+                bound = true;
+                break;
+            }
+        }
+        if !bound {
+            return Err(VclError::Api(
+                "ephemeral source bind exhausted".into(),
+                -1,
+            ));
+        }
+    }
     handle.connect(peer)?;
 
     let deadline = Instant::now() + timeout;
@@ -235,6 +267,7 @@ pub fn query_tcp_dns_sync(
 /// and this function does busy-wait I/O on the caller's thread.
 pub fn query_udp_sync(
     peer: SocketAddr,
+    source: Option<std::net::IpAddr>,
     query: &[u8],
     timeout: Duration,
 ) -> Result<(Vec<u8>, SocketAddr)> {
@@ -254,23 +287,34 @@ pub fn query_udp_sync(
     // VPP 25.10 doesn't auto-assign a source port on `:0` bind —
     // outgoing packets carry source port 0 which real upstreams drop.
     // Pick a random ephemeral port and retry on collision.
+    //
+    // Source IP: when the caller passes Some(ip), bind to it. Some
+    // VPP/VCL configurations (notably routers without a default
+    // route towards the upstream's prefix, or multi-interface setups
+    // where the FIB-derived source isn't unambiguous) emit packets
+    // with src=0.0.0.0 when bound to the wildcard. Real DNS
+    // upstreams drop those silently. Caller-supplied source IP must
+    // match the peer's address family.
+    let bind_ip: std::net::IpAddr = match source {
+        Some(ip) => {
+            if ip.is_ipv4() != peer.is_ipv4() {
+                return Err(VclError::Api(
+                    format!(
+                        "source IP family ({ip}) doesn't match peer family ({peer})"
+                    ),
+                    -1,
+                ));
+            }
+            ip
+        }
+        None if peer.is_ipv4() => "0.0.0.0".parse().unwrap(),
+        None => "::".parse().unwrap(),
+    };
     let mut rng = rand::thread_rng();
     let mut bound = false;
     for _ in 0..8 {
         let port: u16 = rng.gen_range(LOW..=HIGH);
-        let addr: SocketAddr = if peer.is_ipv4() {
-            format!("0.0.0.0:{port}")
-                .parse()
-                .map_err(|e: std::net::AddrParseError| {
-                    VclError::Api(format!("ephemeral addr: {e}"), -1)
-                })?
-        } else {
-            format!("[::]:{port}")
-                .parse()
-                .map_err(|e: std::net::AddrParseError| {
-                    VclError::Api(format!("ephemeral addr: {e}"), -1)
-                })?
-        };
+        let addr = SocketAddr::new(bind_ip, port);
         if handle.bind(addr).is_ok() {
             bound = true;
             break;
