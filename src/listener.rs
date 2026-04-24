@@ -52,3 +52,9 @@ impl VclListener {
         self.handle.local_addr().ok()
     }
 }
+
+impl Drop for VclListener {
+    fn drop(&mut self) {
+        self.reactor.deregister(self.handle.0);
+    }
+}

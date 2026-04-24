@@ -49,6 +49,25 @@ impl VclApp {
     }
 }
 
+/// Register the current thread as a VCL worker.
+///
+/// VCL uses a worker-per-thread model — every thread that touches
+/// a VCL session (via `recv`, `send`, `connect`, etc.) must first
+/// have allocated its own worker context. The main thread that
+/// calls `VclApp::init` is registered implicitly as worker-0; any
+/// other thread must call this before making a VCL call or
+/// `libvppcom` will SEGV inside `vppcom_session_*`.
+///
+/// Call this from `tokio::runtime::Builder::on_thread_start` when
+/// using the multi-threaded runtime so every worker thread is
+/// registered at spin-up. Safe to call repeatedly — VCL returns
+/// the existing worker index if the thread is already registered.
+pub fn register_worker_thread() {
+    unsafe {
+        ffi::vppcom_worker_register();
+    }
+}
+
 impl Drop for VclApp {
     fn drop(&mut self) {
         unsafe {

@@ -12,6 +12,8 @@ pub enum VclError {
     Closed,
     #[error("would block")]
     WouldBlock,
+    #[error("timed out")]
+    Timeout,
 }
 
 impl VclError {

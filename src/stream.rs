@@ -178,6 +178,17 @@ impl VclStream {
     }
 }
 
+impl Drop for VclStream {
+    fn drop(&mut self) {
+        // Accepted sessions AND client-connect sessions are both
+        // registered with the reactor on creation; deregister before
+        // the underlying SessionHandle closes so the reactor's
+        // waiters map doesn't leak entries for every VclStream that
+        // was ever opened.
+        self.reactor.deregister(self.handle.0);
+    }
+}
+
 // ---- tokio::io::AsyncRead / AsyncWrite ----
 //
 // These let `tokio-rustls`, `hyper`, `axum`, and anything else that
