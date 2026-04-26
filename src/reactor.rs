@@ -145,7 +145,7 @@ impl VclReactor {
                 self.mq_fd.readable(),
             )
             .await
-            .map_err(|_| VclError::Api("timeout waiting for VCL event".into(), -libc::ETIMEDOUT))?
+            .map_err(|_| VclError::Timeout)?
             .map_err(|e| VclError::Io(e))?;
 
             // Drain VCL events and notify waiters.

@@ -46,11 +46,12 @@ impl VclStream {
     ) -> Result<Self> {
         // VCL uses a worker-per-thread model. If this task is
         // running on a Tokio worker thread that hasn't registered
-        // with VCL yet, session_create will segfault. Register
-        // (idempotent — returns existing index if already done).
-        unsafe {
-            crate::ffi::vppcom_worker_register();
-        }
+        // with VCL yet, session_create will segfault. Register via
+        // the safe wrapper — the wrapper short-circuits when this
+        // thread is already registered AND serializes registrations
+        // process-wide so concurrent register-vs-session_create
+        // races on libvppcom's worker-pool can't happen.
+        crate::app::register_worker_thread();
         let handle = SessionHandle::create_tcp(true)?;
         handle.set_nodelay().ok();
 
@@ -72,7 +73,7 @@ impl VclStream {
         // for async read/write.
         let sh = handle.0;
         let connect_result = tokio::task::spawn_blocking(move || {
-            unsafe { crate::ffi::vppcom_worker_register(); }
+            crate::app::register_worker_thread();
             // Create a blocking session for the connect.
             let blocking_sh = unsafe {
                 crate::ffi::vppcom_session_create(crate::ffi::VPPCOM_PROTO_TCP, 0)

@@ -16,9 +16,7 @@ pub struct VclListener {
 impl VclListener {
     /// Bind and listen on `addr` through VPP's TCP stack.
     pub fn bind(addr: SocketAddr, reactor: VclReactor) -> Result<Self> {
-        unsafe {
-            crate::ffi::vppcom_worker_register();
-        }
+        crate::app::register_worker_thread();
         let handle = SessionHandle::create_tcp(true)?;
         handle.bind(addr)?;
         handle.listen(128)?;
@@ -29,6 +27,11 @@ impl VclListener {
 
     /// Accept the next incoming connection. Blocks (async) until
     /// a connection arrives.
+    /// Accept the next inbound TCP connection. Awaits until one
+    /// arrives. Like `VclDgramSocket::recv_from`, the 5-minute
+    /// internal `wait_readable` timeout is swallowed and re-armed —
+    /// `accept` semantically blocks for the next connection regardless
+    /// of how long the listener has been idle.
     pub async fn accept(&self) -> Result<(VclStream, SocketAddr)> {
         loop {
             match self.handle.accept() {
@@ -39,9 +42,14 @@ impl VclListener {
                     return Ok((stream, peer_addr));
                 }
                 Err(crate::error::VclError::WouldBlock) => {
-                    self.reactor
+                    match self
+                        .reactor
                         .wait_readable(self.handle.0, Duration::from_secs(300))
-                        .await?;
+                        .await
+                    {
+                        Ok(()) | Err(crate::error::VclError::Timeout) => {}
+                        Err(e) => return Err(e),
+                    }
                 }
                 Err(e) => return Err(e),
             }

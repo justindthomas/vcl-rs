@@ -43,9 +43,7 @@ impl VclDgramSocket {
     /// is ignored for datagram protocols. This matches what the VCL
     /// UDP echo examples do.
     pub fn bind(addr: SocketAddr, reactor: VclReactor) -> Result<Self> {
-        unsafe {
-            crate::ffi::vppcom_worker_register();
-        }
+        crate::app::register_worker_thread();
         let handle = SessionHandle::create_udp(true)?;
         handle.bind(addr)?;
         handle.listen(0)?; // backlog ignored for UDP
@@ -99,14 +97,24 @@ impl VclDgramSocket {
 
     /// Receive one datagram into `buf`. Awaits until one is available.
     /// Returns (bytes_copied, peer_addr).
+    ///
+    /// `wait_readable`'s 5-minute internal timeout fires if no datagram
+    /// arrives in that window; we silently re-arm and keep waiting.
+    /// `recv_from` semantically blocks until data arrives, so a quiet
+    /// listener should never surface a "timeout" error to the caller.
     pub async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
         loop {
             match self.handle.recvfrom(buf) {
                 Ok(pair) => return Ok(pair),
                 Err(VclError::WouldBlock) => {
-                    self.reactor
+                    match self
+                        .reactor
                         .wait_readable(self.handle.0, Duration::from_secs(300))
-                        .await?;
+                        .await
+                    {
+                        Ok(()) | Err(VclError::Timeout) => {} // re-arm
+                        Err(e) => return Err(e),
+                    }
                 }
                 Err(e) => return Err(e),
             }
@@ -149,9 +157,7 @@ pub fn query_tcp_dns_sync(
     query: &[u8],
     timeout: Duration,
 ) -> Result<Vec<u8>> {
-    unsafe {
-        crate::ffi::vppcom_worker_register();
-    }
+    crate::app::register_worker_thread();
 
     let handle = SessionHandle::create_tcp(true)?;
     // Bind a source-IP-with-ephemeral-port BEFORE connect when the
@@ -275,12 +281,11 @@ pub fn query_udp_sync(
     const LOW: u16 = 32768;
     const HIGH: u16 = 60999;
 
-    // Ensure the thread is a VCL worker. Idempotent: returns the
-    // existing worker index if already registered (which it will be
-    // for any tokio blocking-pool thread once on_thread_start fires).
-    unsafe {
-        crate::ffi::vppcom_worker_register();
-    }
+    // Ensure the thread is a VCL worker. Idempotent on the safe
+    // wrapper (thread-local short-circuit) and serialized via a
+    // process-wide mutex so we can never race the libvppcom worker-
+    // pool growth path against a concurrent session_create.
+    crate::app::register_worker_thread();
 
     let handle = SessionHandle::create_udp(true)?;
 
