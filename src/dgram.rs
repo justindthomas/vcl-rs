@@ -191,7 +191,15 @@ pub fn query_tcp_dns_sync(
             ));
         }
     }
-    handle.connect(peer)?;
+    // Non-blocking VCL TCP connect returns WouldBlock immediately
+    // (the session is in CONNECT state, SYN sent, waiting on SYN+ACK).
+    // That's normal — the write loop below polls until the session
+    // becomes writable. Treat WouldBlock here as "in progress",
+    // bubble up anything else.
+    match handle.connect(peer) {
+        Ok(()) | Err(VclError::WouldBlock) => {}
+        Err(e) => return Err(e),
+    }
 
     let deadline = Instant::now() + timeout;
 
