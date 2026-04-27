@@ -191,12 +191,74 @@ pub fn query_tcp_dns_sync(
             ));
         }
     }
+    // VCL session state transitions (CONNECT → ESTABLISHED, etc.)
+    // are delivered as events on the worker's message queue. The
+    // session's local "connected" flag — what `write` checks before
+    // accepting bytes — only updates when the worker drains an MQ
+    // event. Plain `vppcom_session_send` does NOT drain the MQ on
+    // its own; if we busy-sleep between writes, the CONNECTED event
+    // sits in the queue and `write` keeps returning ENOTCONN even
+    // though VPP's TCP stack already finished the handshake. Use a
+    // per-call epoll set with `vppcom_epoll_wait` to drain MQ events
+    // (and block briefly on the actual eventfd) instead of sleep.
+    let vep = unsafe { crate::ffi::vppcom_epoll_create() };
+    if vep < 0 {
+        return Err(VclError::Api(format!("vppcom_epoll_create: {}", vep), vep));
+    }
+    let vep = vep as u32;
+    let mut ev = crate::ffi::epoll_event {
+        events: crate::ffi::EPOLLIN | crate::ffi::EPOLLOUT | crate::ffi::EPOLLET,
+        data: u64::from(handle.0),
+    };
+    let rv = unsafe {
+        crate::ffi::vppcom_epoll_ctl(vep, crate::ffi::EPOLL_CTL_ADD, handle.0, &mut ev)
+    };
+    if rv < 0 {
+        unsafe {
+            crate::ffi::vppcom_session_close(vep);
+        }
+        return Err(VclError::Api(format!("vppcom_epoll_ctl ADD: {}", rv), rv));
+    }
+    // Drain the MQ for up to `wait_ms` milliseconds, returning whether
+    // any events fired. Used between write/read polls instead of
+    // sleep so the session's CONNECTED transition gets processed.
+    let drain_mq = |wait_ms: f64| {
+        let mut events = [crate::ffi::epoll_event { events: 0, data: 0 }; 4];
+        unsafe {
+            crate::ffi::vppcom_epoll_wait(
+                vep,
+                events.as_mut_ptr(),
+                events.len() as i32,
+                wait_ms,
+            );
+        }
+    };
+
+    // RAII cleanup so we close `vep` on every return path below.
+    struct EpollGuard(u32);
+    impl Drop for EpollGuard {
+        fn drop(&mut self) {
+            unsafe {
+                crate::ffi::vppcom_session_close(self.0);
+            }
+        }
+    }
+    let _vep_guard = EpollGuard(vep);
+
+    let connect_t0 = Instant::now();
     // Non-blocking VCL TCP connect returns WouldBlock immediately
     // (the session is in CONNECT state, SYN sent, waiting on SYN+ACK).
     // That's normal — the write loop below polls until the session
     // becomes writable. Treat WouldBlock here as "in progress",
     // bubble up anything else.
-    match handle.connect(peer) {
+    let connect_result = handle.connect(peer);
+    tracing::trace!(
+        peer = %peer,
+        elapsed_us = connect_t0.elapsed().as_micros() as u64,
+        "vcl_tcp: connect returned: {:?}",
+        connect_result
+    );
+    match connect_result {
         Ok(()) | Err(VclError::WouldBlock) => {}
         Err(e) => return Err(e),
     }
@@ -211,27 +273,60 @@ pub fn query_tcp_dns_sync(
     framed.extend_from_slice(query);
 
     let mut sent = 0;
+    let mut write_polls: u64 = 0;
+    let mut last_write_err: Option<VclError> = None;
     while sent < framed.len() {
         match handle.write(&framed[sent..]) {
-            Ok(n) => sent += n,
+            Ok(n) => {
+                if write_polls > 0 {
+                    tracing::debug!(
+                        peer = %peer,
+                        polls = write_polls,
+                        elapsed_ms = connect_t0.elapsed().as_millis() as u64,
+                        "vcl_tcp: write succeeded after polling (handshake completed)"
+                    );
+                }
+                sent += n;
+            }
             // WouldBlock = TX FIFO full; NotConnected = TCP handshake
             // hasn't completed yet (session is in CONNECT state, not
             // CONNECTED). Both are transient — sleep and retry.
-            Err(VclError::WouldBlock) | Err(VclError::NotConnected) => {
+            Err(e @ (VclError::WouldBlock | VclError::NotConnected)) => {
+                last_write_err = Some(e);
+                write_polls += 1;
                 if Instant::now() >= deadline {
+                    tracing::info!(
+                        peer = %peer,
+                        polls = write_polls,
+                        elapsed_ms = connect_t0.elapsed().as_millis() as u64,
+                        last_err = ?last_write_err,
+                        "vcl_tcp: TIMEOUT waiting for session to become writable (handshake never completed)"
+                    );
                     return Err(VclError::Timeout);
                 }
-                std::thread::sleep(Duration::from_millis(5));
+                drain_mq(5.0);
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                tracing::info!(peer = %peer, "vcl_tcp: write error: {:?}", e);
+                return Err(e);
+            }
         }
     }
 
     // Read the 2-byte length prefix.
+    let read_t0 = Instant::now();
     let mut lenbuf = [0u8; 2];
     let mut got = 0;
+    let mut read_polls: u64 = 0;
     while got < 2 {
         if Instant::now() >= deadline {
+            tracing::info!(
+                peer = %peer,
+                read_polls,
+                read_elapsed_ms = read_t0.elapsed().as_millis() as u64,
+                total_elapsed_ms = connect_t0.elapsed().as_millis() as u64,
+                "vcl_tcp: TIMEOUT waiting for length prefix (write succeeded; no response received)"
+            );
             return Err(VclError::Timeout);
         }
         match handle.read(&mut lenbuf[got..]) {
@@ -242,7 +337,8 @@ pub fn query_tcp_dns_sync(
             // belt-and-suspenders: VPP can briefly report it during
             // close-state transitions.
             Err(VclError::WouldBlock) | Err(VclError::NotConnected) => {
-                std::thread::sleep(Duration::from_millis(5));
+                read_polls += 1;
+                drain_mq(5.0);
             }
             Err(e) => return Err(e),
         }
@@ -257,18 +353,31 @@ pub fn query_tcp_dns_sync(
     let mut filled = 0;
     while filled < len {
         if Instant::now() >= deadline {
+            tracing::info!(
+                peer = %peer,
+                got_len_prefix = true,
+                expected = len,
+                filled,
+                "vcl_tcp: TIMEOUT mid-body"
+            );
             return Err(VclError::Timeout);
         }
         match handle.read(&mut resp[filled..]) {
             Ok(0) => return Err(VclError::Closed),
             Ok(n) => filled += n,
             Err(VclError::WouldBlock) | Err(VclError::NotConnected) => {
-                std::thread::sleep(Duration::from_millis(5));
+                drain_mq(5.0);
             }
             Err(e) => return Err(e),
         }
     }
 
+    tracing::debug!(
+        peer = %peer,
+        bytes = resp.len(),
+        elapsed_ms = connect_t0.elapsed().as_millis() as u64,
+        "vcl_tcp: query complete"
+    );
     Ok(resp)
 }
 
