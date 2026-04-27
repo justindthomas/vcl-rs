@@ -10,6 +10,8 @@ pub enum VclError {
     Io(#[from] std::io::Error),
     #[error("session closed")]
     Closed,
+    #[error("not connected")]
+    NotConnected,
     #[error("would block")]
     WouldBlock,
     #[error("timed out")]
@@ -21,7 +23,16 @@ impl VclError {
         if rc == -libc::EWOULDBLOCK || rc == -libc::EAGAIN || rc == -libc::EINPROGRESS {
             return VclError::WouldBlock;
         }
-        if rc == -libc::ECONNRESET || rc == -libc::ENOTCONN || rc == -libc::EPIPE {
+        // ENOTCONN is distinct from Closed: VPP returns it on read/write
+        // against a TCP session whose 3-way handshake hasn't completed
+        // yet (state CONNECT). Lumping it with Closed (ECONNRESET/EPIPE)
+        // makes the non-blocking TCP connect path look like a hard
+        // failure when it just needs more polling. Callers in the
+        // poll loop should treat NotConnected like WouldBlock.
+        if rc == -libc::ENOTCONN {
+            return VclError::NotConnected;
+        }
+        if rc == -libc::ECONNRESET || rc == -libc::EPIPE {
             return VclError::Closed;
         }
         let msg = vcl_retval_str(rc);

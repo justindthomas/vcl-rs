@@ -214,7 +214,10 @@ pub fn query_tcp_dns_sync(
     while sent < framed.len() {
         match handle.write(&framed[sent..]) {
             Ok(n) => sent += n,
-            Err(VclError::WouldBlock) => {
+            // WouldBlock = TX FIFO full; NotConnected = TCP handshake
+            // hasn't completed yet (session is in CONNECT state, not
+            // CONNECTED). Both are transient — sleep and retry.
+            Err(VclError::WouldBlock) | Err(VclError::NotConnected) => {
                 if Instant::now() >= deadline {
                     return Err(VclError::Timeout);
                 }
@@ -234,7 +237,11 @@ pub fn query_tcp_dns_sync(
         match handle.read(&mut lenbuf[got..]) {
             Ok(0) => return Err(VclError::Closed),
             Ok(n) => got += n,
-            Err(VclError::WouldBlock) => {
+            // NotConnected during read shouldn't happen post-write
+            // (the session must've been CONNECTED to send), but
+            // belt-and-suspenders: VPP can briefly report it during
+            // close-state transitions.
+            Err(VclError::WouldBlock) | Err(VclError::NotConnected) => {
                 std::thread::sleep(Duration::from_millis(5));
             }
             Err(e) => return Err(e),
@@ -255,7 +262,7 @@ pub fn query_tcp_dns_sync(
         match handle.read(&mut resp[filled..]) {
             Ok(0) => return Err(VclError::Closed),
             Ok(n) => filled += n,
-            Err(VclError::WouldBlock) => {
+            Err(VclError::WouldBlock) | Err(VclError::NotConnected) => {
                 std::thread::sleep(Duration::from_millis(5));
             }
             Err(e) => return Err(e),
