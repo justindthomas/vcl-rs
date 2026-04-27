@@ -35,6 +35,82 @@ pub struct VclDgramSocket {
     reactor: VclReactor,
 }
 
+/// Drain VCL message-queue events for up to 200 ms after a bind so
+/// the async `bound_handler` runs. If VPP rejects the bind (port
+/// already listened on, etc.) libvppcom closes the session in the
+/// handler — turning an indirect "session is broken later" into a
+/// sync `Err` here lets the caller fail fast. Bind succeeds in the
+/// happy path within a millisecond, so the wall-clock cost is the
+/// failure case only.
+pub(crate) fn verify_bind_or_err(session: u32, requested: SocketAddr) -> Result<()> {
+    let vep = unsafe { crate::ffi::vppcom_epoll_create() };
+    if vep < 0 {
+        return Err(VclError::Api(format!("vppcom_epoll_create: {vep}"), vep));
+    }
+    let vep = vep as u32;
+    let mut ev = crate::ffi::epoll_event {
+        events: crate::ffi::EPOLLIN
+            | crate::ffi::EPOLLOUT
+            | crate::ffi::EPOLLHUP
+            | crate::ffi::EPOLLRDHUP
+            | crate::ffi::EPOLLET,
+        data: u64::from(session),
+    };
+    let rv = unsafe {
+        crate::ffi::vppcom_epoll_ctl(vep, crate::ffi::EPOLL_CTL_ADD, session, &mut ev)
+    };
+    if rv < 0 {
+        unsafe {
+            crate::ffi::vppcom_session_close(vep);
+        }
+        return Err(VclError::Api(format!("vppcom_epoll_ctl ADD: {rv}"), rv));
+    }
+    let mut events = [crate::ffi::epoll_event { events: 0, data: 0 }; 8];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+    while std::time::Instant::now() < deadline {
+        unsafe {
+            crate::ffi::vppcom_epoll_wait(
+                vep,
+                events.as_mut_ptr(),
+                events.len() as i32,
+                30.0,
+            );
+        }
+    }
+    unsafe {
+        crate::ffi::vppcom_session_close(vep);
+    }
+
+    // After the drain, confirm the session is still queryable. If
+    // bound_handler closed it (VPP-side rejection), local_addr will
+    // return an error. If it's still bound, local_addr returns the
+    // bound endpoint — sanity-check that it matches what we asked.
+    let session_handle = SessionHandle(session);
+    let actual = session_handle.local_addr().map_err(|e| {
+        VclError::Api(
+            format!(
+                "VPP rejected bind on {requested}: {e:?} \
+                 (port-in-use is the common cause; libvppcom \
+                 logs the specific reason)"
+            ),
+            -1,
+        )
+    })?;
+    // Don't run the handle's Drop — caller still owns it.
+    std::mem::forget(session_handle);
+    if actual.port() != requested.port() {
+        return Err(VclError::Api(
+            format!(
+                "VPP bound {actual} but we asked for {requested} \
+                 (port mismatch — likely VPP picked a different port \
+                 because the requested one was unavailable)"
+            ),
+            -1,
+        ));
+    }
+    Ok(())
+}
+
 impl VclDgramSocket {
     /// Bind a UDP socket to `addr` through VPP's session layer.
     ///
@@ -47,6 +123,17 @@ impl VclDgramSocket {
         let handle = SessionHandle::create_udp(true)?;
         handle.bind(addr)?;
         handle.listen(0)?; // backlog ignored for UDP
+        // The async `bound_handler` from VPP confirms (or rejects)
+        // the bind via the message queue. Without draining we'd
+        // return Ok here even when VPP later rejects with e.g.
+        // "ip port pair already listened on" (impd misbehaving and
+        // double-spawning dnsd was the production trigger), and the
+        // caller would proceed to use a broken session whose error
+        // path can fan out badly. Drain briefly + confirm the local
+        // addr is still queryable; libvppcom closes the session on
+        // bound-handler failure, so local_addr() turns the async
+        // failure into a sync Err.
+        verify_bind_or_err(handle.0, addr)?;
         reactor.register(handle.0)?;
         tracing::info!(%addr, "VCL dgram bound");
         Ok(Self { handle, reactor })

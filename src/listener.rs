@@ -20,6 +20,12 @@ impl VclListener {
         let handle = SessionHandle::create_tcp(true)?;
         handle.bind(addr)?;
         handle.listen(128)?;
+        // Drain MQ so VPP's async `bound_handler` runs; if VPP
+        // rejects the bind (e.g., port already listened on by
+        // another app instance) we surface that as a sync Err
+        // here rather than letting the caller proceed with a
+        // half-broken session. See dgram.rs for full rationale.
+        crate::dgram::verify_bind_or_err(handle.0, addr)?;
         reactor.register(handle.0)?;
         tracing::info!(%addr, "VCL listener bound");
         Ok(VclListener { handle, reactor })
