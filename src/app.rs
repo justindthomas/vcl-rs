@@ -88,11 +88,13 @@ impl VclApp {
 /// the FFI call so two threads can't race the worker-pool realloc
 /// inside libvppcom — see `REGISTER_LOCK` for the gory details).
 ///
-/// Call this from `tokio::runtime::Builder::on_thread_start` when
-/// using the multi-threaded runtime so every worker thread is
-/// registered at spin-up. Pair with `prewarm` at startup so all
-/// workers materialize before the first session op runs — that
-/// closes the register-vs-session race window for good.
+/// On failure (`-17` from `vppcom_worker_register`, almost always
+/// VPP-side fifo-segment exhaustion when a previous app instance
+/// crashed and left memfd-backed segments stranded), this calls
+/// `vppcom_worker_unregister` to reclaim the local-pool slot that
+/// `vcl_worker_alloc_and_init` already grabbed before the VPP
+/// register failed. Without that the local pool fills up across
+/// retries even though no usable workers exist.
 pub fn register_worker_thread() {
     REGISTERED.with(|r| {
         if r.get() {
@@ -105,12 +107,19 @@ pub fn register_worker_thread() {
             .name()
             .unwrap_or("<unnamed>")
             .to_owned();
-        // INFO on success, WARN on failure — libvppcom 25.10 has a
-        // hard cap on per-app workers (~16 incl. main), and going
-        // past it returns rc=-17 with idx=-1. Callers in dnsd
-        // explicitly check `vppcom_worker_index()` after this and
-        // bail the thread out if registration didn't take.
         if idx < 0 {
+            // Reclaim the local vcl_worker pool slot the failed
+            // register already took. Per VPP source review: on the
+            // server-fail path `vppcom.c` returns without calling
+            // `vcl_worker_free`, leaving a hole. Subsequent
+            // registrations from other threads might bypass it
+            // because `pool_get` always returns the lowest free
+            // index, but if we keep retrying on the same thread
+            // we'd burn through the pool. Best-effort cleanup; we
+            // ignore the unregister return code.
+            unsafe {
+                ffi::vppcom_worker_unregister();
+            }
             tracing::warn!(
                 thread.name = %name,
                 register_rc = rc,
