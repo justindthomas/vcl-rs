@@ -23,7 +23,7 @@
 //! # }
 //! ```
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use crate::error::{Result, VclError};
@@ -363,5 +363,177 @@ impl Drop for VclDgramSocket {
         // the recursor spins up, piling up under load until mutex
         // contention wedges the runtime.
         self.reactor.deregister(self.handle.0);
+    }
+}
+
+/// Ask VPP what local source IP it would pick when sending UDP to
+/// `peer`. Useful for auto-detecting an outgoing source — particularly
+/// for IPv6, where there's no NAT to translate the source for us so
+/// the bound IP must be something globally routable that VPP's FIB
+/// agrees with. v4 callers usually want the LAN-side IP (so NAT can
+/// translate cleanly) rather than what VPP would pick natively, so
+/// this is mostly an IPv6 helper in practice.
+///
+/// Implementation: create a temp UDP session, bind to the wildcard
+/// for `peer`'s family, `sendto` a one-byte probe (forces VPP to do
+/// route lookup + source selection), then read the session's local
+/// addr. Closes the session before returning.
+///
+/// Cost: leaks one libvppcom shared-memory FIFO segment (~128 MB
+/// virtual) per call, same as `query_udp_sync`. Intended for
+/// one-shot startup probes only — do NOT call in a hot path.
+///
+/// The probe byte itself is one UDP datagram to `peer`. Pick a
+/// destination you don't mind sending stray packets to (e.g. a root
+/// NS or a public DNS resolver).
+pub fn probe_local_source(peer: SocketAddr) -> Result<SocketAddr> {
+    crate::app::register_worker_thread();
+    // Blocking session so `connect` settles synchronously. VPP's
+    // non-blocking UDP `connect` returns `WouldBlock` on the first
+    // call and would need its own busy-poll loop; for a one-shot
+    // startup probe a blocking session is simpler.
+    let handle = SessionHandle::create_udp(false)?;
+
+    let bind_ip: IpAddr = if peer.is_ipv4() {
+        "0.0.0.0".parse().unwrap()
+    } else {
+        "::".parse().unwrap()
+    };
+
+    use rand::Rng;
+    const LOW: u16 = 32768;
+    const HIGH: u16 = 60999;
+    let mut rng = rand::thread_rng();
+    let mut bound = false;
+    for _ in 0..8 {
+        let port: u16 = rng.gen_range(LOW..=HIGH);
+        if handle.bind(SocketAddr::new(bind_ip, port)).is_ok() {
+            bound = true;
+            break;
+        }
+    }
+    if !bound {
+        return Err(VclError::Api("probe: ephemeral bind exhausted".into(), -1));
+    }
+
+    // `connect` on a UDP session triggers VPP's route lookup +
+    // source-address selection without actually putting a packet on
+    // the wire. After this returns, GET_LCL_ADDR should reflect
+    // VPP's chosen source.
+    handle.connect(peer)?;
+
+    handle.local_addr()
+}
+
+/// Long-lived UDP socket for clients that need many sendto/recvfrom
+/// operations to different peers — e.g. a DNS recursor's upstream
+/// query path. Avoids the per-query session-creation churn of
+/// `query_udp_sync`, which leaks libvppcom shared-memory FIFO
+/// segments (each new VCL session allocates a 128 MB shared segment
+/// from VPP's session layer that is NOT reclaimed on
+/// `vppcom_session_close`; ~130 ephemeral sessions OOMs the host).
+///
+/// This is a SYNC primitive intended for `std::thread`-based callers
+/// (not tokio); it busy-polls `recvfrom` like `query_udp_sync` does
+/// and shares the same worker-per-thread invariant. Bind and use the
+/// socket on the same OS thread, drop on the same thread.
+///
+/// Trade-off: source-port randomisation is per-socket (per worker
+/// thread), not per-query. A recursor with N worker threads gets
+/// N distinct source ports across all upstream queries, which is
+/// less Kaminsky entropy than random-per-query but still meaningful
+/// — the 16-bit TXID + 0x20 case randomisation remain on every
+/// query. Increase the worker pool if you want more port diversity.
+pub struct VclUdpSyncSocket {
+    handle: SessionHandle,
+}
+
+impl VclUdpSyncSocket {
+    /// Bind a UDP socket to a random ephemeral port on a local
+    /// source IP. Source family must match `is_v6`. When `source`
+    /// is None, binds the wildcard for the family (`0.0.0.0` or
+    /// `::`) — same caveat as `query_udp_sync`: VPP's FIB-based
+    /// source selection works on simple setups and emits packets
+    /// with src=0 on others.
+    pub fn bind(source: Option<IpAddr>, is_v6: bool) -> Result<Self> {
+        crate::app::register_worker_thread();
+        let handle = SessionHandle::create_udp(true)?;
+
+        let bind_ip: IpAddr = match (source, is_v6) {
+            (Some(ip @ IpAddr::V4(_)), false) => ip,
+            (Some(ip @ IpAddr::V6(_)), true) => ip,
+            (Some(ip), _) => {
+                return Err(VclError::Api(
+                    format!("source {ip} family doesn't match is_v6={is_v6}"),
+                    -1,
+                ))
+            }
+            (None, false) => "0.0.0.0".parse().unwrap(),
+            (None, true) => "::".parse().unwrap(),
+        };
+
+        use rand::Rng;
+        const LOW: u16 = 32768;
+        const HIGH: u16 = 60999;
+        let mut rng = rand::thread_rng();
+        let mut bound = false;
+        for _ in 0..8 {
+            let port: u16 = rng.gen_range(LOW..=HIGH);
+            if handle.bind(SocketAddr::new(bind_ip, port)).is_ok() {
+                bound = true;
+                break;
+            }
+        }
+        if !bound {
+            return Err(VclError::Api("ephemeral bind exhausted".into(), -1));
+        }
+        handle.listen(0)?;
+        Ok(Self { handle })
+    }
+
+    /// The local address VPP picked for this socket. Useful for
+    /// logging the actual ephemeral port so operator captures can
+    /// match.
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        self.handle.local_addr()
+    }
+
+    /// Send `query` to `peer` and busy-poll for a response from
+    /// the same peer IP, up to `timeout`. Stray responses (e.g.
+    /// late arrivals from a previous query that timed out on this
+    /// socket) are discarded.
+    pub fn query(
+        &self,
+        peer: SocketAddr,
+        query: &[u8],
+        timeout: Duration,
+    ) -> Result<(Vec<u8>, SocketAddr)> {
+        self.handle.sendto(query, peer)?;
+
+        let deadline = Instant::now() + timeout;
+        let mut buf = vec![0u8; 4096];
+        loop {
+            match self.handle.recvfrom(&mut buf) {
+                Ok((n, from)) => {
+                    if from.ip() != peer.ip() {
+                        // Stray response from a different peer —
+                        // probably a late arrival from a previous
+                        // query on this same long-lived socket.
+                        // Discard and keep waiting for ours.
+                        continue;
+                    }
+                    let mut out = Vec::with_capacity(n);
+                    out.extend_from_slice(&buf[..n]);
+                    return Ok((out, from));
+                }
+                Err(VclError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return Err(VclError::Timeout);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 }

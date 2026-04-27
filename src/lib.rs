@@ -79,7 +79,9 @@ pub mod session; // pub for endpoint_from_addr used by VclTransport's I/O thread
 pub mod stream;
 
 pub use app::{prewarm, register_worker_thread, VclApp};
-pub use dgram::{query_tcp_dns_sync, query_udp_sync, VclDgramSocket};
+pub use dgram::{
+    probe_local_source, query_tcp_dns_sync, query_udp_sync, VclDgramSocket, VclUdpSyncSocket,
+};
 pub use listener::VclListener;
 pub use reactor::VclReactor;
 pub use stream::VclStream;
