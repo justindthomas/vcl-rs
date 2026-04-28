@@ -108,6 +108,58 @@ impl VclStream {
         })
     }
 
+    /// Connect to a remote address through VPP's TCP stack, async,
+    /// staying on the calling Tokio task (no spawn_blocking). The
+    /// session is created in non-blocking mode, registered with the
+    /// reactor, then `connect()` returns immediately with WouldBlock
+    /// while VPP runs the handshake. We await `wait_writable` on
+    /// the session — VCL emits an EPOLLOUT event when the session
+    /// transitions to ESTABLISHED, the reactor wakes us, and we
+    /// hand back a ready-to-use `VclStream`.
+    ///
+    /// Critical for the same reason `connect()` (the older sync
+    /// variant) needed `spawn_blocking`: VCL's worker-per-thread
+    /// invariant means every session op must run on the OS thread
+    /// that owns the worker context. With current_thread Tokio,
+    /// THIS task already runs on the main thread (worker-0,
+    /// registered by `VclApp::init`), so all ops happen on the
+    /// right thread. No cross-thread session handoffs needed.
+    pub async fn connect_async(
+        addr: SocketAddr,
+        source: Option<SocketAddr>,
+        reactor: VclReactor,
+        timeout: Duration,
+    ) -> Result<Self> {
+        crate::app::register_worker_thread();
+        let handle = SessionHandle::create_tcp(true)?;
+        handle.set_nodelay().ok();
+
+        if let Some(src) = source {
+            handle.bind(src)?;
+        }
+
+        // Register with the reactor BEFORE issuing connect so we
+        // don't race a CONNECTED event arriving before we're
+        // listening for it.
+        reactor.register(handle.0)?;
+
+        match handle.connect(addr) {
+            Ok(()) | Err(VclError::WouldBlock) => {}
+            Err(e) => return Err(e),
+        }
+
+        // Wait for the session to become writable — VCL emits an
+        // EPOLLOUT event when the TCP handshake completes.
+        reactor.wait_writable(handle.0, timeout).await?;
+
+        Ok(VclStream {
+            handle,
+            reactor,
+            pending_readable: None,
+            pending_writable: None,
+        })
+    }
+
     /// Wrap an already-accepted session handle.
     pub(crate) fn from_accepted(handle: SessionHandle, reactor: VclReactor) -> Self {
         handle.set_nodelay().ok();

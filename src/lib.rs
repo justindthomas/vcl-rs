@@ -80,7 +80,8 @@ pub mod stream;
 
 pub use app::{prewarm, register_worker_thread, VclApp};
 pub use dgram::{
-    probe_local_source, query_tcp_dns_sync, query_udp_sync, VclDgramSocket, VclUdpSyncSocket,
+    probe_local_source, query_tcp_dns_async, query_tcp_dns_sync, query_udp_sync,
+    VclDgramSocket, VclUdpSyncSocket,
 };
 pub use listener::VclListener;
 pub use reactor::VclReactor;

@@ -230,6 +230,85 @@ impl VclDgramSocket {
     }
 }
 
+/// One-shot async TCP DNS query — open a session via
+/// `VclStream::connect_async`, send the query with the RFC 1035
+/// 2-byte length prefix, read the response, close.
+///
+/// Stays on the caller's Tokio task throughout (no spawn_blocking).
+/// Caller must be on a VCL-registered thread — for current_thread
+/// runtime that's the main thread, which `VclApp::init` registers
+/// as worker-0.
+pub async fn query_tcp_dns_async(
+    peer: SocketAddr,
+    source: Option<std::net::IpAddr>,
+    query: &[u8],
+    reactor: crate::VclReactor,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    use rand::Rng;
+    const LOW: u16 = 32768;
+    const HIGH: u16 = 60999;
+
+    // Pre-generate the random ports BEFORE any await. `thread_rng`
+    // is `!Send` (it's an `Rc<UnsafeCell<...>>`), so holding it
+    // across an await would force the whole returned future to be
+    // !Send — breaking every caller that expects to spawn this on
+    // a multi-thread runtime or hand its future to a Send-bounded
+    // FuturesUnordered. Generating up front keeps the rng off the
+    // future's stack frame entirely.
+    let started = Instant::now();
+    let stream = if let Some(ip) = source {
+        if ip.is_ipv4() != peer.is_ipv4() {
+            return Err(VclError::Api(
+                format!("source IP family ({ip}) doesn't match peer ({peer})"),
+                -1,
+            ));
+        }
+        let ports: [u16; 8] = {
+            let mut rng = rand::thread_rng();
+            std::array::from_fn(|_| rng.gen_range(LOW..=HIGH))
+        };
+        let mut last_err: Option<VclError> = None;
+        let mut connected: Option<crate::VclStream> = None;
+        for port in ports {
+            let src = SocketAddr::new(ip, port);
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(VclError::Timeout);
+            }
+            match crate::VclStream::connect_async(peer, Some(src), reactor.clone(), remaining)
+                .await
+            {
+                Ok(s) => {
+                    connected = Some(s);
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        connected.ok_or_else(|| {
+            last_err.unwrap_or_else(|| VclError::Api("connect retries exhausted".into(), -1))
+        })?
+    } else {
+        crate::VclStream::connect_async(peer, None, reactor, timeout).await?
+    };
+
+    let mut framed = Vec::with_capacity(2 + query.len());
+    framed.extend_from_slice(&(query.len() as u16).to_be_bytes());
+    framed.extend_from_slice(query);
+    stream.write_all(&framed).await?;
+
+    let mut lenbuf = [0u8; 2];
+    stream.read_exact(&mut lenbuf).await?;
+    let len = u16::from_be_bytes(lenbuf) as usize;
+    if len == 0 {
+        return Err(VclError::Api("zero-length DNS response".into(), -1));
+    }
+    let mut resp = vec![0u8; len];
+    stream.read_exact(&mut resp).await?;
+    Ok(resp)
+}
+
 /// One-shot synchronous TCP DNS query on the caller's thread: open
 /// a fresh TCP session to `peer`, send `query` with the RFC 1035
 /// 2-byte length prefix, read the response, close.
