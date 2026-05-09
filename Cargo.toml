@@ -5,6 +5,7 @@ edition = "2021"
 description = "Async Rust wrapper for VPP's VCL (VPP Communications Library)"
 license = "MPL-2.0"
 authors = ["Justin Thomas"]
+exclude = ["fuzz", "audit-results"]
 
 [dependencies]
 tokio = { version = "1", features = ["net", "io-util", "sync", "time", "macros", "rt"] }

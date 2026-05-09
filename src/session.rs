@@ -37,7 +37,8 @@ impl SessionHandle {
     }
 
     pub fn bind(&self, addr: SocketAddr) -> Result<()> {
-        let mut ep = endpoint_from_addr(addr);
+        let mut ip_buf = [0u8; 16];
+        let mut ep = endpoint_into_buf(addr, &mut ip_buf);
         let rc = unsafe { ffi::vppcom_session_bind(self.0, &mut ep) };
         if rc < 0 {
             return Err(VclError::from_rc(rc));
@@ -68,7 +69,8 @@ impl SessionHandle {
     }
 
     pub fn connect(&self, addr: SocketAddr) -> Result<()> {
-        let mut ep = endpoint_from_addr(addr);
+        let mut ip_buf = [0u8; 16];
+        let mut ep = endpoint_into_buf(addr, &mut ip_buf);
         let rc = unsafe { ffi::vppcom_session_connect(self.0, &mut ep) };
         if rc < 0 {
             return Err(VclError::from_rc(rc));
@@ -207,40 +209,15 @@ impl Drop for SessionHandle {
     }
 }
 
-/// Build a `vppcom_endpt_t` from a Rust `SocketAddr`. The caller
-/// must keep `addr_buf` alive for the lifetime of the returned
-/// endpoint (the `ip` pointer points into it).
-pub fn endpoint_from_addr(addr: SocketAddr) -> ffi::vppcom_endpt_t {
-    // We leak a small allocation here for the IP bytes. This is
-    // acceptable because endpoints are short-lived (used for one
-    // bind/connect call then dropped). A production version could
-    // use a stack buffer, but the FFI boundary makes lifetimes
-    // awkward.
-    let (is_ip4, ip_ptr) = match addr.ip() {
-        IpAddr::V4(v4) => {
-            let bytes = Box::leak(Box::new(v4.octets()));
-            (1u8, bytes.as_mut_ptr())
-        }
-        IpAddr::V6(v6) => {
-            let bytes = Box::leak(Box::new(v6.octets()));
-            (0u8, bytes.as_mut_ptr())
-        }
-    };
-    ffi::vppcom_endpt_t {
-        unused: 0,
-        is_ip4,
-        ip: ip_ptr,
-        port: addr.port().to_be(),
-        unused2: 0,
-        app_tlv_len: 0,
-        app_tlvs: std::ptr::null_mut(),
-    }
-}
-
 /// Build a `vppcom_endpt_t` that borrows IP bytes from a caller-owned
-/// 16-byte buffer. Non-leaking — use this for hot-path sends (UDP
-/// `sendto`) where the original `endpoint_from_addr` would allocate
-/// once per call.
+/// 16-byte buffer. The buffer must outlive the returned endpoint —
+/// VCL reads through the `ip` pointer during the FFI call, so a
+/// stack array in the same function frame is the typical pattern.
+///
+/// IPv4 addresses populate the first 4 bytes; IPv6 fills all 16. The
+/// caller need not zero `ip_buf` first (we overwrite the prefix used
+/// by `is_ip4`), but a freshly-zeroed buffer is harmless and is what
+/// every callsite in this crate hands in.
 pub fn endpoint_into_buf(addr: SocketAddr, ip_buf: &mut [u8; 16]) -> ffi::vppcom_endpt_t {
     let is_ip4 = match addr.ip() {
         IpAddr::V4(v4) => {

@@ -81,7 +81,8 @@ impl VclStream {
             if blocking_sh < 0 {
                 return Err(VclError::from_rc(blocking_sh));
             }
-            let mut ep = crate::session::endpoint_from_addr(addr);
+            let mut ip_buf = [0u8; 16];
+            let mut ep = crate::session::endpoint_into_buf(addr, &mut ip_buf);
             let rc = unsafe {
                 crate::ffi::vppcom_session_connect(blocking_sh as u32, &mut ep)
             };

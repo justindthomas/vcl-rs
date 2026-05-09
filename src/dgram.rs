@@ -43,6 +43,15 @@ pub struct VclDgramSocket {
 /// happy path within a millisecond, so the wall-clock cost is the
 /// failure case only.
 pub(crate) fn verify_bind_or_err(session: u32, requested: SocketAddr) -> Result<()> {
+    // Note on epoll-handle cleanup below: VCL has no
+    // `vppcom_epoll_destroy`. Per `vppcom.c::vppcom_epoll_create`,
+    // an epoll set is allocated through the same `vcl_session_alloc`
+    // pool as a regular session (just flagged with
+    // `VCL_SESSION_F_IS_VEP`); `vcl_session_cleanup` checks that
+    // flag and uses the VEP-specific teardown path. So
+    // `vppcom_session_close(vep)` is the correct, documented way
+    // to free an epoll handle — verified against VPP source on
+    // 2026-05-08.
     let vep = unsafe { crate::ffi::vppcom_epoll_create() };
     if vep < 0 {
         return Err(VclError::Api(format!("vppcom_epoll_create: {vep}"), vep));
@@ -230,6 +239,42 @@ impl VclDgramSocket {
     }
 }
 
+/// Build the RFC 1035 §4.2.2 TCP DNS framing for an outbound query:
+/// 2-byte big-endian length prefix followed by the query body.
+///
+/// Returns `Err` if the query is larger than 65535 bytes — the
+/// length field can't represent that, and silently truncating with
+/// `as u16` would desynchronise the channel (server reads `len`
+/// bytes, treats `query[len..]` as a new message, both sides
+/// misparse from then on).
+pub fn frame_tcp_dns_query(query: &[u8]) -> Result<Vec<u8>> {
+    let len_u16 = u16::try_from(query.len()).map_err(|_| {
+        VclError::Api(
+            format!("DNS query too large for TCP framing: {} bytes", query.len()),
+            -1,
+        )
+    })?;
+    let mut framed = Vec::with_capacity(2 + query.len());
+    framed.extend_from_slice(&len_u16.to_be_bytes());
+    framed.extend_from_slice(query);
+    Ok(framed)
+}
+
+/// Decode the 2-byte TCP DNS length prefix into a non-zero usize.
+///
+/// Returns `Err` for the only invalid encoding — a zero-length
+/// response, which would otherwise let an upstream nameserver burn
+/// us out of the read loop with a successfully-framed empty body.
+/// Any other 16-bit value is accepted; it's RFC-bounded to ≤65535
+/// by construction so the caller can `vec![0u8; len]` safely.
+pub fn decode_tcp_dns_len(prefix: [u8; 2]) -> Result<usize> {
+    let len = u16::from_be_bytes(prefix) as usize;
+    if len == 0 {
+        return Err(VclError::Api("zero-length DNS response".into(), -1));
+    }
+    Ok(len)
+}
+
 /// One-shot async TCP DNS query — open a session via
 /// `VclStream::connect_async`, send the query with the RFC 1035
 /// 2-byte length prefix, read the response, close.
@@ -293,17 +338,12 @@ pub async fn query_tcp_dns_async(
         crate::VclStream::connect_async(peer, None, reactor, timeout).await?
     };
 
-    let mut framed = Vec::with_capacity(2 + query.len());
-    framed.extend_from_slice(&(query.len() as u16).to_be_bytes());
-    framed.extend_from_slice(query);
+    let framed = frame_tcp_dns_query(query)?;
     stream.write_all(&framed).await?;
 
     let mut lenbuf = [0u8; 2];
     stream.read_exact(&mut lenbuf).await?;
-    let len = u16::from_be_bytes(lenbuf) as usize;
-    if len == 0 {
-        return Err(VclError::Api("zero-length DNS response".into(), -1));
-    }
+    let len = decode_tcp_dns_len(lenbuf)?;
     let mut resp = vec![0u8; len];
     stream.read_exact(&mut resp).await?;
     Ok(resp)
@@ -401,6 +441,10 @@ pub fn query_tcp_dns_sync(
     };
 
     // RAII cleanup so we close `vep` on every return path below.
+    // `vppcom_session_close` is the right call — see the long
+    // comment in `verify_bind_or_err` above; VCL stores epoll
+    // handles in the same pool as sessions and dispatches on
+    // `VCL_SESSION_F_IS_VEP`.
     struct EpollGuard(u32);
     impl Drop for EpollGuard {
         fn drop(&mut self) {
@@ -434,9 +478,7 @@ pub fn query_tcp_dns_sync(
     // Wait for connect to complete — non-blocking connect returns
     // immediately but the session isn't writable until the SYN+ACK
     // lands. Poll `write` to detect readiness.
-    let mut framed = Vec::with_capacity(2 + query.len());
-    framed.extend_from_slice(&(query.len() as u16).to_be_bytes());
-    framed.extend_from_slice(query);
+    let framed = frame_tcp_dns_query(query)?;
 
     let mut sent = 0;
     let mut write_polls: u64 = 0;
@@ -509,10 +551,7 @@ pub fn query_tcp_dns_sync(
             Err(e) => return Err(e),
         }
     }
-    let len = u16::from_be_bytes(lenbuf) as usize;
-    if len == 0 {
-        return Err(VclError::Api("zero-length DNS response".into(), -1));
-    }
+    let len = decode_tcp_dns_len(lenbuf)?;
 
     // Read the body.
     let mut resp = vec![0u8; len];
@@ -825,5 +864,61 @@ impl VclUdpSyncSocket {
                 Err(e) => return Err(e),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_tcp_dns_len, frame_tcp_dns_query};
+    use crate::error::VclError;
+
+    #[test]
+    fn frame_query_round_trips_small_payload() {
+        let q = b"\x00\x01abcdef";
+        let framed = frame_tcp_dns_query(q).expect("small frame ok");
+        assert_eq!(framed.len(), 2 + q.len());
+        assert_eq!(&framed[..2], &(q.len() as u16).to_be_bytes());
+        assert_eq!(&framed[2..], q);
+    }
+
+    #[test]
+    fn frame_query_accepts_max_u16() {
+        let q = vec![0xAA; u16::MAX as usize];
+        let framed = frame_tcp_dns_query(&q).expect("max-u16 frame ok");
+        assert_eq!(&framed[..2], &[0xFF, 0xFF]);
+        assert_eq!(framed.len(), 2 + u16::MAX as usize);
+    }
+
+    #[test]
+    fn frame_query_rejects_oversize() {
+        let q = vec![0u8; u16::MAX as usize + 1];
+        match frame_tcp_dns_query(&q) {
+            Err(VclError::Api(msg, -1)) => assert!(msg.contains("too large")),
+            other => panic!("expected Api(too large), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_len_rejects_zero() {
+        match decode_tcp_dns_len([0, 0]) {
+            Err(VclError::Api(msg, -1)) => assert!(msg.contains("zero-length")),
+            other => panic!("expected Api(zero-length), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_len_accepts_one() {
+        assert_eq!(decode_tcp_dns_len([0, 1]).unwrap(), 1);
+    }
+
+    #[test]
+    fn decode_len_accepts_max() {
+        assert_eq!(decode_tcp_dns_len([0xFF, 0xFF]).unwrap(), 65535);
+    }
+
+    #[test]
+    fn decode_len_is_big_endian() {
+        // 0x0100 big-endian = 256; little-endian misread would be 1.
+        assert_eq!(decode_tcp_dns_len([0x01, 0x00]).unwrap(), 256);
     }
 }

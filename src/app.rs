@@ -125,14 +125,20 @@ pub fn register_worker_thread() {
                 register_rc = rc,
                 "VCL worker registration failed — thread cannot use VCL sessions"
             );
+            // Leave REGISTERED unset: a later session op on this
+            // thread would otherwise proceed against an unregistered
+            // worker context and segfault inside libvppcom. Keeping
+            // the flag clear means the next call retries the FFI
+            // registration, which is the correct recovery once the
+            // VPP-side fifo segments are reclaimed.
         } else {
             tracing::debug!(
                 thread.name = %name,
                 worker_idx = idx,
                 "VCL worker registered"
             );
+            r.set(true);
         }
-        r.set(true);
     });
 }
 

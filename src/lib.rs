@@ -75,13 +75,13 @@ pub mod dgram;
 pub mod error;
 pub mod listener;
 pub mod reactor;
-pub mod session; // pub for endpoint_from_addr used by VclTransport's I/O thread
+pub mod session; // pub for endpoint_into_buf used by VclTransport's I/O thread
 pub mod stream;
 
 pub use app::{prewarm, register_worker_thread, VclApp};
 pub use dgram::{
-    probe_local_source, query_tcp_dns_async, query_tcp_dns_sync, query_udp_sync,
-    VclDgramSocket, VclUdpSyncSocket,
+    decode_tcp_dns_len, frame_tcp_dns_query, probe_local_source, query_tcp_dns_async,
+    query_tcp_dns_sync, query_udp_sync, VclDgramSocket, VclUdpSyncSocket,
 };
 pub use listener::VclListener;
 pub use reactor::VclReactor;
