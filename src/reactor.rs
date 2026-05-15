@@ -1,17 +1,27 @@
-//! Tokio integration for VCL sessions.
+//! Tokio integration for VLS sessions.
 //!
-//! VCL exposes a message-queue eventfd via `vppcom_mq_epoll_fd()`
-//! that becomes readable whenever any VCL session has pending
-//! events. We wrap this in a `tokio::io::unix::AsyncFd` so the
-//! Tokio runtime wakes us when VCL has work to do.
+//! VLS exposes a message-queue eventfd via `vppcom_mq_epoll_fd()`
+//! that becomes readable whenever any session has pending events.
+//! We wrap this in a `tokio::io::unix::AsyncFd` so the Tokio
+//! runtime wakes us when VLS has work to do.
 //!
-//! The reactor owns a VCL epoll set (`vppcom_epoll_create`).
-//! Sessions are registered with `vppcom_epoll_ctl` and we drain
-//! events with `vppcom_epoll_wait(timeout=0)` (non-blocking)
-//! whenever the MQ fd fires.
+//! The reactor owns a VLS epoll set (`vls_epoll_create`). Sessions
+//! are registered with `vls_epoll_ctl` and we drain events with
+//! `vls_epoll_wait(timeout=0)` (non-blocking) whenever the MQ fd
+//! fires.
 //!
 //! Waiters register via `wait_readable` / `wait_writable` and are
 //! woken by a `tokio::sync::Notify` per session.
+//!
+//! ## Cross-thread correctness via VLS
+//!
+//! Under VLS the underlying session pool is shared across all
+//! "VLS-registered" threads (lazily, via `vls_mt_detect`), and
+//! every VLS op (including the epoll-set ones) takes the VLS lock
+//! for its duration. So a reactor created on thread A can be
+//! driven from any thread; sessions registered from thread A can
+//! be polled / drained from thread B. This is what makes a
+//! multi-thread tokio runtime on top of vcl-rs viable.
 //!
 //! ## The `has_event` stall and how we work around it
 //!
@@ -26,14 +36,12 @@
 //! `vppctl show session verbose 2` exposes this as `has_event 1`
 //! with `cursize > 0`.
 //!
-//! Workaround: a background task ticks every 50ms, drains any
-//! fresh MQ events the normal way (catches missed-edge cases on
-//! the eventfd), and then `notify_one()`s every waiter in the map
-//! regardless. The woken `recvfrom` retries, sees the buffered
-//! bytes, makes forward progress; eventually the fifo drains,
-//! `has_event` clears, normal event delivery resumes. Cost is
-//! bounded: 20 wake-ups per second on an otherwise idle dnsd,
-//! ~50ms latency floor on the masked case.
+//! Workaround: a background task ticks periodically, drains any
+//! fresh VLS epoll events the normal way (catches missed-edge
+//! cases on the eventfd), and then `notify_one()`s every waiter
+//! in the map regardless. The woken `recvfrom` retries, sees the
+//! buffered bytes, makes forward progress; eventually the fifo
+//! drains, `has_event` clears, normal event delivery resumes.
 //!
 //! The `wait_event` loop also `tokio::select!`s between the MQ
 //! eventfd and the per-session Notify so the periodic notify-all
@@ -52,10 +60,12 @@ use crate::error::{Result, VclError};
 use crate::ffi;
 
 struct ReactorInner {
-    /// VCL epoll handle (from vppcom_epoll_create).
-    vep: u32,
-    /// Per-session notification. When a VCL epoll event fires for
-    /// a session, we notify its waiter.
+    /// VLS epoll handle (from vls_epoll_create).
+    vep: ffi::vls_handle_t,
+    /// Per-session notification. When a VLS epoll event fires for
+    /// a session, we notify its waiter. Keyed on the raw
+    /// `vls_handle_t` value (signed; callers pass us non-negative
+    /// values from `SessionHandle::0`).
     waiters: HashMap<u32, Arc<Notify>>,
 }
 
@@ -81,7 +91,14 @@ impl VclReactor {
     /// be called from a tokio runtime context — both the AsyncFd
     /// registration and the periodic-drain task spawn require it.
     pub fn new() -> Result<Self> {
-        let vep = unsafe { ffi::vppcom_epoll_create() };
+        // Ensure this thread is added to VLS before fetching the
+        // MQ-epoll fd. `vppcom_mq_epoll_fd` reads `vcl_worker_get_current()`,
+        // which would be -1 on a thread that hasn't yet called any
+        // VLS op. The explicit register is idempotent — VLS would
+        // auto-register on the first vls_* call anyway.
+        crate::app::register_worker_thread();
+
+        let vep = unsafe { ffi::vls_epoll_create() };
         if vep < 0 {
             return Err(VclError::from_rc(vep));
         }
@@ -93,11 +110,11 @@ impl VclReactor {
             ));
         }
         let async_fd = AsyncFd::with_interest(MqFd(mq_raw), Interest::READABLE)
-            .map_err(|e| VclError::Io(e))?;
+            .map_err(VclError::Io)?;
 
         let reactor = VclReactor {
             inner: Arc::new(Mutex::new(ReactorInner {
-                vep: vep as u32,
+                vep,
                 waiters: HashMap::new(),
             })),
             mq_fd: Arc::new(async_fd),
@@ -173,19 +190,28 @@ impl VclReactor {
         Ok(reactor)
     }
 
-    /// Register a session handle with the VCL epoll set.
+    /// Register a session handle with the VLS epoll set.
     /// Watches for read + write + edge-triggered.
     pub fn register(&self, session_handle: u32) -> Result<()> {
         let inner = self.inner.lock().unwrap();
+        // Level-triggered, NOT edge-triggered. EPOLLET requires the
+        // application to fully drain the FIFO on each wake; the
+        // pre-VLS reactor used it and that worked because every
+        // session op happened on the worker thread and the read
+        // loop drained eagerly. Under VLS the upstream-UDP demux
+        // loop registers AFTER data may already be buffered, and
+        // we never see an empty→non-empty edge — `Rx-f=19934`
+        // sits unread. LT fires whenever there's pending readable
+        // data, which is the semantic we actually want here.
         let mut ev = ffi::epoll_event {
-            events: ffi::EPOLLIN | ffi::EPOLLOUT | ffi::EPOLLET,
+            events: ffi::EPOLLIN | ffi::EPOLLOUT,
             data: session_handle as u64,
         };
         let rc = unsafe {
-            ffi::vppcom_epoll_ctl(
+            ffi::vls_epoll_ctl(
                 inner.vep,
                 ffi::EPOLL_CTL_ADD,
-                session_handle,
+                session_handle as ffi::vls_handle_t,
                 &mut ev,
             )
         };
@@ -200,10 +226,10 @@ impl VclReactor {
         let mut inner = self.inner.lock().unwrap();
         inner.waiters.remove(&session_handle);
         unsafe {
-            ffi::vppcom_epoll_ctl(
+            ffi::vls_epoll_ctl(
                 inner.vep,
                 ffi::EPOLL_CTL_DEL,
-                session_handle,
+                session_handle as ffi::vls_handle_t,
                 std::ptr::null_mut(),
             );
         }
@@ -211,7 +237,7 @@ impl VclReactor {
 
     /// Wait until the given session is readable (has data or a
     /// new connection to accept). Integrates with Tokio by waiting
-    /// on the MQ eventfd, then draining VCL epoll events.
+    /// on the MQ eventfd, then draining VLS epoll events.
     pub async fn wait_readable(&self, session_handle: u32, timeout: Duration) -> Result<()> {
         self.wait_event(session_handle, ffi::EPOLLIN, timeout).await
     }
@@ -261,7 +287,7 @@ impl VclReactor {
         }
     }
 
-    /// Non-blocking drain of all pending VCL epoll events. Wakes
+    /// Non-blocking drain of all pending VLS epoll events. Wakes
     /// the per-session Notify for each session that had an event.
     fn drain_events(&self) {
         drain_events_with_inner(&self.inner);
@@ -273,7 +299,7 @@ fn drain_events_with_inner(inner_arc: &Arc<Mutex<ReactorInner>>) {
     let mut events = [ffi::epoll_event { events: 0, data: 0 }; 64];
     loop {
         let n = unsafe {
-            ffi::vppcom_epoll_wait(
+            ffi::vls_epoll_wait(
                 inner.vep,
                 events.as_mut_ptr(),
                 events.len() as i32,

@@ -38,93 +38,19 @@ pub struct VclStream {
 
 impl VclStream {
     /// Connect to a remote address through VPP's TCP stack.
-    pub async fn connect(
-        addr: SocketAddr,
-        source: Option<SocketAddr>,
-        timeout: Duration,
-        reactor: VclReactor,
-    ) -> Result<Self> {
-        // VCL uses a worker-per-thread model. If this task is
-        // running on a Tokio worker thread that hasn't registered
-        // with VCL yet, session_create will segfault. Register via
-        // the safe wrapper — the wrapper short-circuits when this
-        // thread is already registered AND serializes registrations
-        // process-wide so concurrent register-vs-session_create
-        // races on libvppcom's worker-pool can't happen.
-        crate::app::register_worker_thread();
-        let handle = SessionHandle::create_tcp(true)?;
-        handle.set_nodelay().ok();
-
-        if let Some(src) = source {
-            handle.bind(src)?;
-        }
-
-        // VCL connect on a non-blocking session returns immediately
-        // (or EINPROGRESS). We register for EPOLLOUT to detect
-        // completion.
-        // For the initial connect, use a blocking session so we
-        // don't need cross-worker epoll. VCL's non-blocking
-        // connect + epoll requires all operations on the same
-        // worker thread, which conflicts with Tokio's task
-        // scheduling. We spawn_blocking the connect to avoid
-        // blocking the Tokio runtime.
-        //
-        // After connect completes, we register with the reactor
-        // for async read/write.
-        let sh = handle.0;
-        let connect_result = tokio::task::spawn_blocking(move || {
-            crate::app::register_worker_thread();
-            // Create a blocking session for the connect.
-            let blocking_sh = unsafe {
-                crate::ffi::vppcom_session_create(crate::ffi::VPPCOM_PROTO_TCP, 0)
-            };
-            if blocking_sh < 0 {
-                return Err(VclError::from_rc(blocking_sh));
-            }
-            let mut ip_buf = [0u8; 16];
-            let mut ep = crate::session::endpoint_into_buf(addr, &mut ip_buf);
-            let rc = unsafe {
-                crate::ffi::vppcom_session_connect(blocking_sh as u32, &mut ep)
-            };
-            if rc < 0 {
-                unsafe { crate::ffi::vppcom_session_close(blocking_sh as u32); }
-                return Err(VclError::from_rc(rc));
-            }
-            Ok(blocking_sh as u32)
-        })
-        .await
-        .map_err(|e| VclError::Api(format!("spawn_blocking join: {}", e), -1))??;
-
-        // Replace the non-blocking handle with the connected one.
-        // Forget the original (don't close it — it was never connected).
-        std::mem::forget(handle);
-        let handle = SessionHandle(connect_result);
-        handle.set_nodelay().ok();
-
-        Ok(VclStream {
-            handle,
-            reactor,
-            pending_readable: None,
-            pending_writable: None,
-        })
-    }
-
-    /// Connect to a remote address through VPP's TCP stack, async,
-    /// staying on the calling Tokio task (no spawn_blocking). The
+    ///
+    /// Stays on the calling tokio task — no `spawn_blocking`. The
     /// session is created in non-blocking mode, registered with the
     /// reactor, then `connect()` returns immediately with WouldBlock
-    /// while VPP runs the handshake. We await `wait_writable` on
-    /// the session — VCL emits an EPOLLOUT event when the session
-    /// transitions to ESTABLISHED, the reactor wakes us, and we
-    /// hand back a ready-to-use `VclStream`.
+    /// while VPP runs the handshake. We await `wait_writable` — VCL
+    /// emits an EPOLLOUT event when the session transitions to
+    /// ESTABLISHED, the reactor wakes us, and we hand back a
+    /// ready-to-use `VclStream`.
     ///
-    /// Critical for the same reason `connect()` (the older sync
-    /// variant) needed `spawn_blocking`: VCL's worker-per-thread
-    /// invariant means every session op must run on the OS thread
-    /// that owns the worker context. With current_thread Tokio,
-    /// THIS task already runs on the main thread (worker-0,
-    /// registered by `VclApp::init`), so all ops happen on the
-    /// right thread. No cross-thread session handoffs needed.
+    /// Under VLS the old "must be on the registered worker thread"
+    /// rule is gone — VLS auto-registers any caller thread on first
+    /// use and takes a process-wide lock during each op, so this
+    /// future is safe to run from any tokio worker.
     pub async fn connect_async(
         addr: SocketAddr,
         source: Option<SocketAddr>,
@@ -365,7 +291,7 @@ impl AsyncWrite for VclStream {
         let this = self.get_mut();
         // Best-effort shutdown via vppcom_session_shutdown(SHUT_WR).
         let rc = unsafe {
-            crate::ffi::vppcom_session_shutdown(this.handle.0, libc::SHUT_WR as i32)
+            crate::ffi::vls_shutdown(this.handle.0 as crate::ffi::vls_handle_t, libc::SHUT_WR as i32)
         };
         if rc < 0 {
             return Poll::Ready(Err(vcl_to_io(VclError::from_rc(rc))));
