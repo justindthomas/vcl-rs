@@ -109,16 +109,24 @@ impl VclReactor {
         let weak_inner = Arc::downgrade(&reactor.inner);
         let weak_mq = Arc::downgrade(&reactor.mq_fd);
         tokio::spawn(async move {
-            // Tick aggressively (10ms). The `has_event`-blocked
-            // wedge is bounded by this interval, and at 10ms the
-            // worst case is sub-frame latency on a missed wakeup —
-            // matters when many upstream responses queue up while
-            // VPP refuses to fire fresh MQ events. The drain itself
-            // is cheap (single vls/vppcom epoll_wait with timeout=0
-            // returning 0 events when empty), so the steady-state
-            // cost is ~100 wakeups/sec on an otherwise idle dnsd.
-            let mut tick = tokio::time::interval(Duration::from_millis(10));
+            // Periodic forced-progress task. The `has_event`-stall
+            // workaround is bounded by this interval.
+            //
+            // Tick is a compromise: tighter intervals respond faster
+            // to a wedged session but multiply lock-contention cost
+            // because each tick acquires `reactor.inner.lock()` and
+            // iterates `notify_one` over every entry in the waiters
+            // map. Under sustained DoH load with thousands of
+            // accumulated half-handshaked sessions, a 10ms tick
+            // produced enough contention with `wait_event` /
+            // `register` / `deregister` that the runtime livelocked
+            // overnight on jt-router (FIFOs filled, control socket
+            // stopped responding). 50ms restores headroom while
+            // still bounding the worst-case wedge to a typical
+            // resolver retry window.
+            let mut tick = tokio::time::interval(Duration::from_millis(50));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut last_alive = tokio::time::Instant::now();
             loop {
                 tick.tick().await;
                 let (Some(inner), Some(_keepalive_mq)) =
@@ -127,9 +135,25 @@ impl VclReactor {
                     return;
                 };
                 drain_events_with_inner(&inner);
-                let inner = inner.lock().unwrap();
-                for notify in inner.waiters.values() {
-                    notify.notify_one();
+                let (waiters_n, alive_log) = {
+                    let inner = inner.lock().unwrap();
+                    let n = inner.waiters.len();
+                    for notify in inner.waiters.values() {
+                        notify.notify_one();
+                    }
+                    let now = tokio::time::Instant::now();
+                    let log =
+                        now.duration_since(last_alive) >= Duration::from_secs(60);
+                    if log {
+                        last_alive = now;
+                    }
+                    (n, log)
+                };
+                if alive_log {
+                    tracing::info!(
+                        waiters = waiters_n,
+                        "VclReactor drainer alive"
+                    );
                 }
             }
         });
