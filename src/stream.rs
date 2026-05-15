@@ -162,14 +162,26 @@ impl VclStream {
     }
 
     /// Wrap an already-accepted session handle.
-    pub(crate) fn from_accepted(handle: SessionHandle, reactor: VclReactor) -> Self {
+    ///
+    /// The session MUST be put into non-blocking mode here:
+    /// `vppcom_session_accept` yields a blocking session, and a
+    /// blocking `vppcom_session_read` parks the whole vcl-io worker
+    /// thread (a `current_thread` runtime) until the peer sends —
+    /// freezing every other connection on that worker. Returns
+    /// `Err` if the attr call fails rather than handing back a
+    /// session that would wedge the runtime.
+    pub(crate) fn from_accepted(
+        handle: SessionHandle,
+        reactor: VclReactor,
+    ) -> Result<Self> {
+        handle.set_nonblocking()?;
         handle.set_nodelay().ok();
-        VclStream {
+        Ok(VclStream {
             handle,
             reactor,
             pending_readable: None,
             pending_writable: None,
-        }
+        })
     }
 
     /// Read up to `buf.len()` bytes. Returns the number of bytes

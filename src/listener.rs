@@ -44,7 +44,7 @@ impl VclListener {
                 Ok((client_handle, peer_addr)) => {
                     self.reactor.register(client_handle.0)?;
                     let stream =
-                        VclStream::from_accepted(client_handle, self.reactor.clone());
+                        VclStream::from_accepted(client_handle, self.reactor.clone())?;
                     return Ok((stream, peer_addr));
                 }
                 Err(crate::error::VclError::WouldBlock) => {

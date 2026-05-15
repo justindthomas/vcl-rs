@@ -160,6 +160,40 @@ impl SessionHandle {
         Ok(())
     }
 
+    /// Put the session into non-blocking mode.
+    ///
+    /// Load-bearing for accepted sessions: `vppcom_session_accept`
+    /// produces a session that inherits *blocking* semantics, and a
+    /// blocking `vppcom_session_read` parks the calling OS thread
+    /// inside libvppcom until data arrives. Since every vcl-io
+    /// worker is a `current_thread` tokio runtime, one blocking
+    /// read on an idle keep-alive connection freezes the entire
+    /// worker — every other task on it (sibling connections, the
+    /// reactor tick) stalls until that one client happens to send.
+    /// Non-blocking mode makes `read` return `WouldBlock` instead,
+    /// so `poll_read` can park the *task* on the reactor and free
+    /// the thread.
+    ///
+    /// libvppcom's `VPPCOM_ATTR_SET_FLAGS` reads the flags word the
+    /// same way the kernel does; `O_NONBLOCK` is `0o4000` on Linux.
+    pub fn set_nonblocking(&self) -> Result<()> {
+        const O_NONBLOCK: u32 = 0o4000;
+        let val: u32 = O_NONBLOCK;
+        let mut len = std::mem::size_of::<u32>() as u32;
+        let rc = unsafe {
+            ffi::vppcom_session_attr(
+                self.0,
+                ffi::VPPCOM_ATTR_SET_FLAGS,
+                &val as *const _ as *mut _,
+                &mut len,
+            )
+        };
+        if rc < 0 {
+            return Err(VclError::from_rc(rc));
+        }
+        Ok(())
+    }
+
     pub fn local_addr(&self) -> Result<SocketAddr> {
         let mut ip_buf = [0u8; 16];
         let mut ep = ffi::vppcom_endpt_t {
