@@ -12,6 +12,32 @@
 //!
 //! Waiters register via `wait_readable` / `wait_writable` and are
 //! woken by a `tokio::sync::Notify` per session.
+//!
+//! ## The `has_event` stall and how we work around it
+//!
+//! VPP marks each session's RX fifo with a `has_event` flag the
+//! first time it notifies the app, and only clears the flag when
+//! the app drains that fifo back to empty. If a reader pulls some
+//! bytes but not all (e.g. tokio-rustls reads a TLS ClientHello
+//! and then parks waiting for the next handshake message), the
+//! flag stays set, and subsequent data arrivals on that same
+//! session do NOT fire a fresh MQ event. The waiter for that
+//! session is parked on a Notify nobody is going to signal again.
+//! `vppctl show session verbose 2` exposes this as `has_event 1`
+//! with `cursize > 0`.
+//!
+//! Workaround: a background task ticks every 50ms, drains any
+//! fresh MQ events the normal way (catches missed-edge cases on
+//! the eventfd), and then `notify_one()`s every waiter in the map
+//! regardless. The woken `recvfrom` retries, sees the buffered
+//! bytes, makes forward progress; eventually the fifo drains,
+//! `has_event` clears, normal event delivery resumes. Cost is
+//! bounded: 20 wake-ups per second on an otherwise idle dnsd,
+//! ~50ms latency floor on the masked case.
+//!
+//! The `wait_event` loop also `tokio::select!`s between the MQ
+//! eventfd and the per-session Notify so the periodic notify-all
+//! can wake a task whose MQ side is dormant.
 
 use std::collections::HashMap;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -51,7 +77,9 @@ impl AsRawFd for MqFd {
 }
 
 impl VclReactor {
-    /// Create a new reactor. Call once after `VclApp::init`.
+    /// Create a new reactor. Call once after `VclApp::init`. Must
+    /// be called from a tokio runtime context — both the AsyncFd
+    /// registration and the periodic-drain task spawn require it.
     pub fn new() -> Result<Self> {
         let vep = unsafe { ffi::vppcom_epoll_create() };
         if vep < 0 {
@@ -74,6 +102,30 @@ impl VclReactor {
             })),
             mq_fd: Arc::new(async_fd),
         };
+
+        // Periodic forced-progress task — see module docs for the
+        // `has_event` mechanism this works around. Held via Weak so
+        // the task self-exits when the reactor is dropped.
+        let weak_inner = Arc::downgrade(&reactor.inner);
+        let weak_mq = Arc::downgrade(&reactor.mq_fd);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(50));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let (Some(inner), Some(_keepalive_mq)) =
+                    (weak_inner.upgrade(), weak_mq.upgrade())
+                else {
+                    return;
+                };
+                drain_events_with_inner(&inner);
+                let inner = inner.lock().unwrap();
+                for notify in inner.waiters.values() {
+                    notify.notify_one();
+                }
+            }
+        });
+
         Ok(reactor)
     }
 
@@ -139,28 +191,27 @@ impl VclReactor {
         let deadline = tokio::time::Instant::now() + timeout;
 
         loop {
-            // Wait for the MQ fd to become readable (VCL has events).
-            let mut ready = tokio::time::timeout_at(
-                deadline,
-                self.mq_fd.readable(),
-            )
-            .await
-            .map_err(|_| VclError::Timeout)?
-            .map_err(|e| VclError::Io(e))?;
-
-            // Drain VCL events and notify waiters.
-            self.drain_events();
-
-            // Clear the AsyncFd readiness so we re-arm for next time.
-            ready.clear_ready();
-
-            // Check if our session was notified. Use a zero-duration
-            // check — if the notification arrived, proceed; if not,
-            // loop and wait for the next MQ event.
-            if tokio::time::timeout(Duration::from_millis(0), notify.notified())
-                .await
-                .is_ok()
-            {
+            // Wait on EITHER the MQ eventfd firing (normal happy
+            // path) OR the per-session Notify being signalled by
+            // the periodic-drain task (the `has_event`-stall
+            // workaround — see module docs). Without the notify
+            // branch in this select, wait_event parks forever on
+            // mq_fd whenever VPP refuses to fire a fresh MQ event
+            // for a session whose previous event we didn't
+            // "acknowledge" by draining to empty.
+            let progress = tokio::select! {
+                ready = self.mq_fd.readable() => {
+                    let mut ready = ready.map_err(|e| VclError::Io(e))?;
+                    self.drain_events();
+                    ready.clear_ready();
+                    tokio::time::timeout(Duration::from_millis(0), notify.notified())
+                        .await
+                        .is_ok()
+                }
+                _ = notify.notified() => true,
+                _ = tokio::time::sleep_until(deadline) => return Err(VclError::Timeout),
+            };
+            if progress {
                 return Ok(());
             }
         }
@@ -169,29 +220,33 @@ impl VclReactor {
     /// Non-blocking drain of all pending VCL epoll events. Wakes
     /// the per-session Notify for each session that had an event.
     fn drain_events(&self) {
-        let inner = self.inner.lock().unwrap();
-        let mut events = [ffi::epoll_event { events: 0, data: 0 }; 64];
-        loop {
-            let n = unsafe {
-                ffi::vppcom_epoll_wait(
-                    inner.vep,
-                    events.as_mut_ptr(),
-                    events.len() as i32,
-                    0.0, // non-blocking
-                )
-            };
-            if n <= 0 {
-                break;
+        drain_events_with_inner(&self.inner);
+    }
+}
+
+fn drain_events_with_inner(inner_arc: &Arc<Mutex<ReactorInner>>) {
+    let inner = inner_arc.lock().unwrap();
+    let mut events = [ffi::epoll_event { events: 0, data: 0 }; 64];
+    loop {
+        let n = unsafe {
+            ffi::vppcom_epoll_wait(
+                inner.vep,
+                events.as_mut_ptr(),
+                events.len() as i32,
+                0.0, // non-blocking
+            )
+        };
+        if n <= 0 {
+            break;
+        }
+        for i in 0..n as usize {
+            let sh = events[i].data as u32;
+            if let Some(notify) = inner.waiters.get(&sh) {
+                notify.notify_one();
             }
-            for i in 0..n as usize {
-                let sh = events[i].data as u32;
-                if let Some(notify) = inner.waiters.get(&sh) {
-                    notify.notify_one();
-                }
-            }
-            if (n as usize) < events.len() {
-                break;
-            }
+        }
+        if (n as usize) < events.len() {
+            break;
         }
     }
 }

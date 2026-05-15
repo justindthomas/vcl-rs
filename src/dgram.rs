@@ -217,6 +217,42 @@ impl VclDgramSocket {
         }
     }
 
+    /// Non-blocking single-datagram read. Returns `Ok(Some(...))` when
+    /// a datagram is in the RX FIFO, `Ok(None)` when the FIFO is empty
+    /// (would-block), and `Err` on a real failure.
+    ///
+    /// Use this from a "drain greedily then yield" demux loop to avoid
+    /// the tokio per-iteration scheduling latency of `recv_from`. Under
+    /// load, each `recv_from(...).await` checkpoints the task — with
+    /// many concurrent tasks (DoH connections + listener + recursor),
+    /// each task only gets to read ~20 datagrams per second. Tight-
+    /// looping `try_recv_from` lets one wake-up drain hundreds of
+    /// queued responses before yielding.
+    pub fn try_recv_from(&self, buf: &mut [u8]) -> Result<Option<(usize, SocketAddr)>> {
+        match self.handle.recvfrom(buf) {
+            Ok(pair) => Ok(Some(pair)),
+            Err(VclError::WouldBlock) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Park until the underlying session signals readable. Pair with
+    /// `try_recv_from` for the drain-then-park pattern. Same 5-minute
+    /// internal timeout as `recv_from` — silently re-armed if no
+    /// datagram arrives within the window.
+    pub async fn wait_readable(&self) -> Result<()> {
+        loop {
+            match self
+                .reactor
+                .wait_readable(self.handle.0, Duration::from_secs(300))
+                .await
+            {
+                Ok(()) | Err(VclError::Timeout) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Send a datagram to `dst`. If the TX FIFO is full, awaits until
     /// there's space — but UDP sends rarely block, so this is a fast
     /// path in practice.
