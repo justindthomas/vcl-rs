@@ -124,7 +124,19 @@ impl VclReactor {
             // stopped responding). 50ms restores headroom while
             // still bounding the worst-case wedge to a typical
             // resolver retry window.
-            let mut tick = tokio::time::interval(Duration::from_millis(50));
+            // 500ms tick. Each spurious notify wakes every parked
+            // task; each waking task that calls `vppcom_session_read`
+            // pays a ~1ms blocking call inside libvppcom (the
+            // `svm_msg_q_timedwait(timeout=1)` MQ-drain — visible
+            // in gdb backtraces of stuck states). With ~10 active
+            // TLS sessions and a 50ms tick, that's ~10×1×20 = 200ms
+            // of wall-time per second spent inside libvppcom doing
+            // nothing useful, which starves the UDP listener and
+            // the drainer's own tick out of CPU. 500ms keeps the
+            // worst-case `has_event` stall bounded to a typical
+            // resolver retry window while cutting the spurious-wake
+            // overhead by 10x.
+            let mut tick = tokio::time::interval(Duration::from_millis(500));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut last_alive = tokio::time::Instant::now();
             loop {
