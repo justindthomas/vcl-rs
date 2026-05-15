@@ -271,78 +271,49 @@ impl AsyncRead for VclStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-
-        // If we have a pending reactor wait, poll it to completion
-        // first. The OLD shape `loop { poll wait; try read; arm wait;
-        // loop }` was wasteful: if a spurious wake fired between
-        // arm-and-poll (e.g. from `VclReactor`'s periodic notify-all
-        // workaround for VPP's `has_event` stall), we'd burn TWO
-        // `vppcom_session_read` calls per poll_read, each costing
-        // ~1ms in libvppcom's internal `svm_msg_q_timedwait` MQ-drain.
-        // Across many parked TLS sessions plus a 50ms-tick reactor,
-        // that adds up to runtime-starving overhead. Limit ourselves
-        // to ONE handle.read per poll_read invocation: poll the wait
-        // future, and only attempt the FFI read on the first call
-        // (no pending wait yet) or when the wait future resolves.
-        if let Some(fut) = this.pending_readable.as_mut() {
-            match fut.as_mut().poll(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Ok(())) => {
-                    this.pending_readable = None;
-                    // Fall through to attempt the read once.
-                }
-                Poll::Ready(Err(e)) => {
-                    this.pending_readable = None;
-                    return Poll::Ready(Err(vcl_to_io(e)));
-                }
-            }
-        }
-
-        let unfilled = buf.initialize_unfilled();
-        match this.handle.read(unfilled) {
-            Ok(0) => {
-                // VCL's read() treats 0 as Closed internally (see
-                // handle.read). If we see a raw 0 here it's still
-                // EOF — advance nothing + return Ok to signal EOF.
-                Poll::Ready(Ok(()))
-            }
-            Ok(n) => {
-                buf.advance(n);
-                Poll::Ready(Ok(()))
-            }
-            Err(VclError::WouldBlock) => {
-                let reactor = this.reactor.clone();
-                let handle_id = this.handle.0;
-                let mut fut: ReactorWait = Box::pin(async move {
-                    reactor
-                        .wait_readable(handle_id, Duration::from_secs(300))
-                        .await
-                });
-                // Poll the freshly-armed future once so a notify_one
-                // that already fired (race between arm and register)
-                // doesn't get lost. If still Pending, stash and exit.
+        loop {
+            // If we had a pending reactor wait, poll it to completion first.
+            if let Some(fut) = this.pending_readable.as_mut() {
                 match fut.as_mut().poll(cx) {
-                    Poll::Pending => {
-                        this.pending_readable = Some(fut);
-                        Poll::Pending
-                    }
+                    Poll::Pending => return Poll::Pending,
                     Poll::Ready(Ok(())) => {
-                        // Already notified — but DON'T re-enter
-                        // handle.read; let the next poll_read
-                        // invocation do it. Otherwise we re-burn
-                        // the 1ms FFI cost in this same call. Tokio
-                        // will re-poll us promptly because our
-                        // waker has been registered.
-                        cx.waker().wake_by_ref();
-                        Poll::Pending
+                        this.pending_readable = None;
+                        // Fall through and retry the read.
                     }
-                    Poll::Ready(Err(e)) => Poll::Ready(Err(vcl_to_io(e))),
+                    Poll::Ready(Err(e)) => {
+                        this.pending_readable = None;
+                        return Poll::Ready(Err(vcl_to_io(e)));
+                    }
                 }
             }
-            Err(VclError::Closed) => {
-                Poll::Ready(Ok(())) // EOF: buf unchanged
+
+            let unfilled = buf.initialize_unfilled();
+            match this.handle.read(unfilled) {
+                Ok(0) => {
+                    // VCL's read() treats 0 as Closed internally (see
+                    // handle.read). If we see a raw 0 here it's still
+                    // EOF — advance nothing + return Ok to signal EOF.
+                    return Poll::Ready(Ok(()));
+                }
+                Ok(n) => {
+                    buf.advance(n);
+                    return Poll::Ready(Ok(()));
+                }
+                Err(VclError::WouldBlock) => {
+                    let reactor = this.reactor.clone();
+                    let handle_id = this.handle.0;
+                    this.pending_readable = Some(Box::pin(async move {
+                        reactor
+                            .wait_readable(handle_id, Duration::from_secs(300))
+                            .await
+                    }));
+                    // Loop around to poll the newly-armed future.
+                }
+                Err(VclError::Closed) => {
+                    return Poll::Ready(Ok(())); // EOF: buf unchanged
+                }
+                Err(e) => return Poll::Ready(Err(vcl_to_io(e))),
             }
-            Err(e) => Poll::Ready(Err(vcl_to_io(e))),
         }
     }
 }
