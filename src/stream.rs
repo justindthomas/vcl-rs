@@ -265,6 +265,39 @@ fn vcl_to_io(e: VclError) -> io::Error {
 }
 
 impl AsyncRead for VclStream {
+    /// EPOLLET-correct poll_read.
+    ///
+    /// Sessions are registered with the reactor in edge-triggered
+    /// mode (`EPOLLET`): the kernel fires a readiness event ONLY on
+    /// the transition from "no data" to "data present". The
+    /// mandatory counterpart is that the reader must drain the
+    /// underlying FIFO until it returns `WouldBlock` before
+    /// re-arming interest; arming while the FIFO still has bytes
+    /// means no fresh edge will fire when new data arrives and the
+    /// task wedges forever.
+    ///
+    /// Shape:
+    ///
+    /// 1. Resolve any pending `wait_readable` future first (we
+    ///    might be resuming from a parked state).
+    /// 2. Inner loop: call libvppcom_read into the caller's
+    ///    `ReadBuf` repeatedly until one of:
+    ///      a. The buffer fills — return Ready. The FIFO may still
+    ///         have data; the caller's next poll_read will continue
+    ///         draining naturally without needing a fresh edge
+    ///         (FIFO never went empty, so no edge would have fired
+    ///         anyway).
+    ///      b. libvppcom returns `WouldBlock` AND we already read
+    ///         at least one byte — return Ready. The FIFO is now
+    ///         empty; the next poll_read's first read attempt will
+    ///         hit `WouldBlock` and arm interest correctly.
+    ///      c. libvppcom returns `WouldBlock` AND we haven't read
+    ///         anything yet — FIFO was already empty. Arm
+    ///         `wait_readable` and let the outer loop poll the
+    ///         resulting future.
+    ///      d. libvppcom returns `Closed` / 0 — EOF; return Ready
+    ///         (tokio convention: `filled() == 0` on the new bytes
+    ///         signals EOF).
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -272,13 +305,12 @@ impl AsyncRead for VclStream {
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         loop {
-            // If we had a pending reactor wait, poll it to completion first.
+            // 1. Resolve any pending reactor wait.
             if let Some(fut) = this.pending_readable.as_mut() {
                 match fut.as_mut().poll(cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Ok(())) => {
                         this.pending_readable = None;
-                        // Fall through and retry the read.
                     }
                     Poll::Ready(Err(e)) => {
                         this.pending_readable = None;
@@ -287,32 +319,51 @@ impl AsyncRead for VclStream {
                 }
             }
 
-            let unfilled = buf.initialize_unfilled();
-            match this.handle.read(unfilled) {
-                Ok(0) => {
-                    // VCL's read() treats 0 as Closed internally (see
-                    // handle.read). If we see a raw 0 here it's still
-                    // EOF — advance nothing + return Ok to signal EOF.
+            // 2. Drain libvppcom into the caller's buf until full,
+            //    EOF, or WouldBlock. `got_anything` distinguishes
+            //    cases (b) from (c) — only the latter arms.
+            let mut got_anything = false;
+            loop {
+                let unfilled = buf.initialize_unfilled();
+                if unfilled.is_empty() {
+                    // (a) Caller's buf full. Stop. Next poll_read
+                    // will keep draining.
                     return Poll::Ready(Ok(()));
                 }
-                Ok(n) => {
-                    buf.advance(n);
-                    return Poll::Ready(Ok(()));
+                match this.handle.read(unfilled) {
+                    Ok(0) => {
+                        // (d) Raw zero from libvppcom — EOF.
+                        return Poll::Ready(Ok(()));
+                    }
+                    Ok(n) => {
+                        buf.advance(n);
+                        got_anything = true;
+                        // Continue inner loop; try to drain more.
+                    }
+                    Err(VclError::WouldBlock) => {
+                        if got_anything {
+                            // (b) Drained to WouldBlock with data
+                            // already in hand. FIFO is now empty;
+                            // next call will arm if no more data
+                            // arrives in the meantime.
+                            return Poll::Ready(Ok(()));
+                        }
+                        // (c) Nothing read this call. Arm.
+                        let reactor = this.reactor.clone();
+                        let handle_id = this.handle.0;
+                        this.pending_readable = Some(Box::pin(async move {
+                            reactor
+                                .wait_readable(handle_id, Duration::from_secs(300))
+                                .await
+                        }));
+                        break; // outer loop polls the new future
+                    }
+                    Err(VclError::Closed) => {
+                        // (d) Clean EOF.
+                        return Poll::Ready(Ok(()));
+                    }
+                    Err(e) => return Poll::Ready(Err(vcl_to_io(e))),
                 }
-                Err(VclError::WouldBlock) => {
-                    let reactor = this.reactor.clone();
-                    let handle_id = this.handle.0;
-                    this.pending_readable = Some(Box::pin(async move {
-                        reactor
-                            .wait_readable(handle_id, Duration::from_secs(300))
-                            .await
-                    }));
-                    // Loop around to poll the newly-armed future.
-                }
-                Err(VclError::Closed) => {
-                    return Poll::Ready(Ok(())); // EOF: buf unchanged
-                }
-                Err(e) => return Poll::Ready(Err(vcl_to_io(e))),
             }
         }
     }
