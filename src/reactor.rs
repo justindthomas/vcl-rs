@@ -109,7 +109,15 @@ impl VclReactor {
         let weak_inner = Arc::downgrade(&reactor.inner);
         let weak_mq = Arc::downgrade(&reactor.mq_fd);
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_millis(50));
+            // Tick aggressively (10ms). The `has_event`-blocked
+            // wedge is bounded by this interval, and at 10ms the
+            // worst case is sub-frame latency on a missed wakeup —
+            // matters when many upstream responses queue up while
+            // VPP refuses to fire fresh MQ events. The drain itself
+            // is cheap (single vls/vppcom epoll_wait with timeout=0
+            // returning 0 events when empty), so the steady-state
+            // cost is ~100 wakeups/sec on an otherwise idle dnsd.
+            let mut tick = tokio::time::interval(Duration::from_millis(10));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
