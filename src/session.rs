@@ -1,35 +1,19 @@
-//! VCL session: the low-level handle wrapping a single VLS-managed
-//! session lifecycle. Both `VclListener` and `VclStream` are thin
-//! wrappers around this.
-//!
-//! Under VLS, each `vls_handle_t` is an entry in the VLS pool that
-//! internally points at the underlying vppcom session. Every op
-//! takes the VLS process-wide lock for the duration of the call,
-//! so sessions are safe to use from any thread.
+//! VCL session: the low-level handle wrapping a single
+//! `vppcom_session_*` lifecycle. Both `VclListener` and `VclStream`
+//! are thin wrappers around this.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::error::{Result, VclError};
 use crate::ffi;
 
-/// VLS handle wrapper. The underlying VLS API returns `vls_handle_t`
-/// (signed) and uses negative values for errors; we validate at
-/// construction so the stored `u32` is always a real, positive
-/// handle. All FFI calls cast back to `vls_handle_t` at the
-/// boundary. Keeping `u32` here means the reactor's
-/// register-by-handle API (which has always taken `u32`) stays
-/// stable across the libvppcom → VLS port.
+/// Raw session handle returned by `vppcom_session_create`.
 #[derive(Debug)]
 pub(crate) struct SessionHandle(pub u32);
 
 impl SessionHandle {
-    /// Convenience: the VLS-typed view of the inner handle for FFI calls.
-    fn vlsh(&self) -> ffi::vls_handle_t {
-        self.0 as ffi::vls_handle_t
-    }
-
     pub fn create_tcp(nonblocking: bool) -> Result<Self> {
-        let rc = unsafe { ffi::vls_create(ffi::VPPCOM_PROTO_TCP, nonblocking as u8) };
+        let rc = unsafe { ffi::vppcom_session_create(ffi::VPPCOM_PROTO_TCP, nonblocking as u8) };
         if rc < 0 {
             return Err(VclError::from_rc(rc));
         }
@@ -37,7 +21,7 @@ impl SessionHandle {
     }
 
     pub fn create_udp(nonblocking: bool) -> Result<Self> {
-        let rc = unsafe { ffi::vls_create(ffi::VPPCOM_PROTO_UDP, nonblocking as u8) };
+        let rc = unsafe { ffi::vppcom_session_create(ffi::VPPCOM_PROTO_UDP, nonblocking as u8) };
         if rc < 0 {
             return Err(VclError::from_rc(rc));
         }
@@ -45,7 +29,7 @@ impl SessionHandle {
     }
 
     pub fn close(&self) -> Result<()> {
-        let rc = unsafe { ffi::vls_close(self.vlsh()) };
+        let rc = unsafe { ffi::vppcom_session_close(self.0) };
         if rc < 0 {
             return Err(VclError::from_rc(rc));
         }
@@ -55,7 +39,7 @@ impl SessionHandle {
     pub fn bind(&self, addr: SocketAddr) -> Result<()> {
         let mut ip_buf = [0u8; 16];
         let mut ep = endpoint_into_buf(addr, &mut ip_buf);
-        let rc = unsafe { ffi::vls_bind(self.vlsh(), &mut ep) };
+        let rc = unsafe { ffi::vppcom_session_bind(self.0, &mut ep) };
         if rc < 0 {
             return Err(VclError::from_rc(rc));
         }
@@ -63,7 +47,7 @@ impl SessionHandle {
     }
 
     pub fn listen(&self, backlog: u32) -> Result<()> {
-        let rc = unsafe { ffi::vls_listen(self.vlsh(), backlog as std::os::raw::c_int) };
+        let rc = unsafe { ffi::vppcom_session_listen(self.0, backlog) };
         if rc < 0 {
             return Err(VclError::from_rc(rc));
         }
@@ -76,7 +60,7 @@ impl SessionHandle {
             ip: ip_buf.as_mut_ptr(),
             ..Default::default()
         };
-        let rc = unsafe { ffi::vls_accept(self.vlsh(), &mut ep, 0) };
+        let rc = unsafe { ffi::vppcom_session_accept(self.0, &mut ep, 0) };
         if rc < 0 {
             return Err(VclError::from_rc(rc));
         }
@@ -87,7 +71,7 @@ impl SessionHandle {
     pub fn connect(&self, addr: SocketAddr) -> Result<()> {
         let mut ip_buf = [0u8; 16];
         let mut ep = endpoint_into_buf(addr, &mut ip_buf);
-        let rc = unsafe { ffi::vls_connect(self.vlsh(), &mut ep) };
+        let rc = unsafe { ffi::vppcom_session_connect(self.0, &mut ep) };
         if rc < 0 {
             return Err(VclError::from_rc(rc));
         }
@@ -95,17 +79,18 @@ impl SessionHandle {
     }
 
     pub fn read(&self, buf: &mut [u8]) -> Result<usize> {
-        let rc =
-            unsafe { ffi::vls_read(self.vlsh(), buf.as_mut_ptr() as *mut _, buf.len()) };
+        let rc = unsafe {
+            ffi::vppcom_session_read(self.0, buf.as_mut_ptr() as *mut _, buf.len())
+        };
         if rc < 0 {
-            return Err(VclError::from_rc(rc as std::os::raw::c_int));
+            return Err(VclError::from_rc(rc));
         }
         Ok(rc as usize)
     }
 
     pub fn write(&self, buf: &[u8]) -> Result<usize> {
         let rc =
-            unsafe { ffi::vls_write(self.vlsh(), buf.as_ptr() as *mut _, buf.len()) };
+            unsafe { ffi::vppcom_session_write(self.0, buf.as_ptr() as *mut _, buf.len()) };
         if rc < 0 {
             return Err(VclError::from_rc(rc));
         }
@@ -124,8 +109,8 @@ impl SessionHandle {
             ..Default::default()
         };
         let rc = unsafe {
-            ffi::vls_recvfrom(
-                self.vlsh(),
+            ffi::vppcom_session_recvfrom(
+                self.0,
                 buf.as_mut_ptr() as *mut _,
                 buf.len() as u32,
                 0,
@@ -133,7 +118,7 @@ impl SessionHandle {
             )
         };
         if rc < 0 {
-            return Err(VclError::from_rc(rc as std::os::raw::c_int));
+            return Err(VclError::from_rc(rc));
         }
         let addr = addr_from_endpoint(&ep, &ip_buf);
         Ok((rc as usize, addr))
@@ -144,10 +129,10 @@ impl SessionHandle {
         let mut ip_buf = [0u8; 16];
         let mut ep = endpoint_into_buf(dst, &mut ip_buf);
         let rc = unsafe {
-            ffi::vls_sendto(
-                self.vlsh(),
+            ffi::vppcom_session_sendto(
+                self.0,
                 buf.as_ptr() as *mut _,
-                buf.len() as std::os::raw::c_int,
+                buf.len() as u32,
                 0,
                 &mut ep,
             )
@@ -162,8 +147,8 @@ impl SessionHandle {
         let val: u32 = 1;
         let mut len = std::mem::size_of::<u32>() as u32;
         let rc = unsafe {
-            ffi::vls_attr(
-                self.vlsh(),
+            ffi::vppcom_session_attr(
+                self.0,
                 ffi::VPPCOM_ATTR_SET_TCP_NODELAY,
                 &val as *const _ as *mut _,
                 &mut len,
@@ -183,8 +168,8 @@ impl SessionHandle {
         };
         let mut len = std::mem::size_of::<ffi::vppcom_endpt_t>() as u32;
         let rc = unsafe {
-            ffi::vls_attr(
-                self.vlsh(),
+            ffi::vppcom_session_attr(
+                self.0,
                 ffi::VPPCOM_ATTR_GET_LCL_ADDR,
                 &mut ep as *mut _ as *mut _,
                 &mut len,
@@ -204,8 +189,8 @@ impl SessionHandle {
         };
         let mut len = std::mem::size_of::<ffi::vppcom_endpt_t>() as u32;
         let rc = unsafe {
-            ffi::vls_attr(
-                self.vlsh(),
+            ffi::vppcom_session_attr(
+                self.0,
                 ffi::VPPCOM_ATTR_GET_PEER_ADDR,
                 &mut ep as *mut _ as *mut _,
                 &mut len,
@@ -220,7 +205,7 @@ impl SessionHandle {
 
 impl Drop for SessionHandle {
     fn drop(&mut self) {
-        let _ = unsafe { ffi::vls_close(self.vlsh()) };
+        let _ = unsafe { ffi::vppcom_session_close(self.0) };
     }
 }
 

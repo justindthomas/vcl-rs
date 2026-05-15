@@ -1,61 +1,68 @@
-//! VCL application lifecycle (VLS — VCL Locked Sessions).
+//! VCL application lifecycle.
 //!
 //! A `VclApp` must be created once per process before any sessions
-//! can be opened. It calls `vls_app_create` which is the VLS entry
-//! point — internally that runs `vppcom_app_create` AND installs
-//! the VLS process-wide locks plus the per-thread auto-register
-//! hooks. After init, every VLS op called from any thread
-//! auto-registers that thread (via libvppcom's `vls_mt_detect`)
-//! and takes the VLS lock for the duration of the op. The result
-//! is thread-agnostic sessions: a `VclStream` created on thread A
-//! can be read/written from thread B without the GP-faults that
-//! plagued the pre-VLS code path.
+//! can be opened. It calls `vppcom_app_create` which connects to
+//! VPP's session layer via the app-socket-api, sets up shared
+//! memory segments for FIFOs, and creates worker-0.
 //!
 //! Configuration is read from `VCL_CONFIG` env var (defaults to
 //! `/etc/vpp/vcl.conf`). The config tells VCL where VPP's
-//! app-socket-api socket lives. `use-mq-eventfd` is still required
-//! for the reactor's tokio integration.
+//! app-socket-api socket lives.
 //!
-//! Drop calls `vppcom_app_destroy`. (VLS doesn't expose its own
-//! teardown — `vls_app_exit` is an atexit handler libvppcom
-//! installs internally.)
+//! Drop calls `vppcom_app_destroy`.
 
+use std::cell::Cell;
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
 
 use crate::error::{Result, VclError};
 use crate::ffi;
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
+/// Serializes `vppcom_worker_register` calls. libvppcom 25.10's
+/// worker-pool growth is not thread-safe: when it grows the
+/// `vcm->workers` vector it frees the old buffer and writes a new
+/// pointer, but other threads in `vppcom_session_create` (and friends)
+/// load `vcm->workers` once and dereference it later — racing the
+/// realloc gets them a freed pointer and a GP fault. Holding this
+/// mutex across the FFI call removes the register-vs-register race.
+/// The register-vs-session race is killed separately by `prewarm`
+/// (below) — once the workers vector reaches its steady-state size,
+/// no further registrations happen and there's nothing to race with.
+static REGISTER_LOCK: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    /// Per-thread "already registered" flag. Both
+    /// `tokio::runtime::Builder::on_thread_start` and the defensive
+    /// calls inside `query_udp_sync` / `query_tcp_dns_sync` go through
+    /// `register_worker_thread`, so a thread can hit this path several
+    /// times. After the first call libvppcom returns the existing
+    /// worker index — but we still want to skip the FFI hop and the
+    /// mutex acquisition on subsequent calls.
+    static REGISTERED: Cell<bool> = const { Cell::new(false) };
+}
+
 pub struct VclApp {
     _private: (),
 }
 
 impl VclApp {
-    /// Initialize VCL via VLS. Must be called exactly once per
-    /// process. Reads config from `VCL_CONFIG` env var or
-    /// `/etc/vpp/vcl.conf`.
+    /// Initialize VCL. Must be called exactly once per process.
+    /// Reads config from `VCL_CONFIG` env var or `/etc/vpp/vcl.conf`.
     pub fn init(app_name: &str) -> Result<Self> {
         if INITIALIZED.swap(true, Ordering::SeqCst) {
             return Err(VclError::Api("VCL already initialized".into(), -1));
         }
         let c_name =
             CString::new(app_name).map_err(|_| VclError::Api("invalid app name".into(), -1))?;
-        let rc = unsafe { ffi::vls_app_create(c_name.as_ptr()) };
+        let rc = unsafe { ffi::vppcom_app_create(c_name.as_ptr()) };
         if rc < 0 {
             INITIALIZED.store(false, Ordering::SeqCst);
             return Err(VclError::from_rc(rc));
         }
-        let use_eventfd = unsafe { ffi::vls_use_eventfd() } != 0;
-        let mt_wrk = unsafe { ffi::vls_mt_wrk_supported() } != 0;
-        if !use_eventfd {
-            return Err(VclError::Api(
-                "VLS requires use-mq-eventfd in vcl.conf for tokio integration".into(),
-                -1,
-            ));
-        }
-        tracing::info!(app_name, mt_wrk_supported = mt_wrk, "VLS application created");
+        tracing::info!(app_name, "VCL application created");
         Ok(VclApp { _private: () })
     }
 
@@ -67,26 +74,108 @@ impl VclApp {
     }
 }
 
-/// Register the current thread with VLS.
+/// Register the current thread as a VCL worker.
 ///
-/// Under classic libvppcom this was load-bearing — every thread
-/// that touched a session had to call `vppcom_worker_register`
-/// first or libvppcom would GP-fault on the TLS `__vcl_worker_index`.
-/// Under VLS the picture is simpler: every VLS op auto-registers
-/// the calling thread the first time it runs (see `vls_mt_detect`
-/// in `vcl_locked.c`), so explicit calls are only needed before
-/// you touch a non-VLS function on a fresh thread. The one we
-/// actually care about is `vppcom_mq_epoll_fd`, which the reactor
-/// fetches on its construction thread — call this before that fetch.
+/// VCL uses a worker-per-thread model — every thread that touches
+/// a VCL session (via `recv`, `send`, `connect`, etc.) must first
+/// have allocated its own worker context. The main thread that
+/// calls `VclApp::init` is registered implicitly as worker-0; any
+/// other thread must call this before making a VCL call or
+/// `libvppcom` will SEGV inside `vppcom_session_*`.
 ///
-/// Kept as a public function (instead of being deleted entirely)
-/// because the reactor and downstream callers still need a way to
-/// "warm up" a thread's libvppcom TLS without first issuing a real
-/// session op. Idempotent.
+/// Idempotent per-thread (a thread-local flag short-circuits repeat
+/// calls) and serialized across threads (a process-wide mutex wraps
+/// the FFI call so two threads can't race the worker-pool realloc
+/// inside libvppcom — see `REGISTER_LOCK` for the gory details).
+///
+/// On failure (`-17` from `vppcom_worker_register`, almost always
+/// VPP-side fifo-segment exhaustion when a previous app instance
+/// crashed and left memfd-backed segments stranded), this calls
+/// `vppcom_worker_unregister` to reclaim the local-pool slot that
+/// `vcl_worker_alloc_and_init` already grabbed before the VPP
+/// register failed. Without that the local pool fills up across
+/// retries even though no usable workers exist.
 pub fn register_worker_thread() {
-    unsafe {
-        ffi::vls_register_vcl_worker();
+    REGISTERED.with(|r| {
+        if r.get() {
+            return;
+        }
+        let _guard = REGISTER_LOCK.lock().unwrap();
+        let rc = unsafe { ffi::vppcom_worker_register() };
+        let idx = unsafe { ffi::vppcom_worker_index() };
+        let name = std::thread::current()
+            .name()
+            .unwrap_or("<unnamed>")
+            .to_owned();
+        if idx < 0 {
+            // Reclaim the local vcl_worker pool slot the failed
+            // register already took. Per VPP source review: on the
+            // server-fail path `vppcom.c` returns without calling
+            // `vcl_worker_free`, leaving a hole. Subsequent
+            // registrations from other threads might bypass it
+            // because `pool_get` always returns the lowest free
+            // index, but if we keep retrying on the same thread
+            // we'd burn through the pool. Best-effort cleanup; we
+            // ignore the unregister return code.
+            unsafe {
+                ffi::vppcom_worker_unregister();
+            }
+            tracing::warn!(
+                thread.name = %name,
+                register_rc = rc,
+                "VCL worker registration failed — thread cannot use VCL sessions"
+            );
+            // Leave REGISTERED unset: a later session op on this
+            // thread would otherwise proceed against an unregistered
+            // worker context and segfault inside libvppcom. Keeping
+            // the flag clear means the next call retries the FFI
+            // registration, which is the correct recovery once the
+            // VPP-side fifo segments are reclaimed.
+        } else {
+            tracing::debug!(
+                thread.name = %name,
+                worker_idx = idx,
+                "VCL worker registered"
+            );
+            r.set(true);
+        }
+    });
+}
+
+/// Pre-register `n` workers on the tokio blocking pool, synchronously
+/// from the caller's task. Each spawned blocking task calls
+/// `register_worker_thread` and then waits on a barrier so tokio is
+/// forced to materialize `n` distinct threads (otherwise it could run
+/// tasks back-to-back on a single thread and only one worker would
+/// register).
+///
+/// Caller responsibilities:
+///   1. `VclApp::init` must already have run.
+///   2. The tokio runtime's `max_blocking_threads` must be ≥ `n`,
+///      and ideally equal to `n` so runtime growth never spawns a
+///      fresh thread that would re-trigger registration.
+///   3. Call this *before* any VCL session ops are kicked off — the
+///      whole point is to drain libvppcom's worker-pool growth into
+///      a quiet startup window.
+pub async fn prewarm(n: usize) -> Result<()> {
+    if n == 0 {
+        return Ok(());
     }
+    let barrier = Arc::new(Barrier::new(n));
+    let mut handles = Vec::with_capacity(n);
+    for _ in 0..n {
+        let b = barrier.clone();
+        handles.push(tokio::task::spawn_blocking(move || {
+            register_worker_thread();
+            b.wait();
+        }));
+    }
+    for h in handles {
+        h.await
+            .map_err(|e| VclError::Api(format!("prewarm join: {e}"), -1))?;
+    }
+    tracing::info!(workers = n, "VCL workers pre-warmed");
+    Ok(())
 }
 
 impl Drop for VclApp {

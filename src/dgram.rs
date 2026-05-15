@@ -43,14 +43,20 @@ pub struct VclDgramSocket {
 /// happy path within a millisecond, so the wall-clock cost is the
 /// failure case only.
 pub(crate) fn verify_bind_or_err(session: u32, requested: SocketAddr) -> Result<()> {
-    // Note on epoll-handle cleanup below: VLS has no destroy
-    // function for epoll handles either; `vls_close(vep)` is the
-    // documented path (same shape as `vppcom_session_close(vep)`
-    // before the VLS port — see VPP `vcl_locked.c`).
-    let vep = unsafe { crate::ffi::vls_epoll_create() };
+    // Note on epoll-handle cleanup below: VCL has no
+    // `vppcom_epoll_destroy`. Per `vppcom.c::vppcom_epoll_create`,
+    // an epoll set is allocated through the same `vcl_session_alloc`
+    // pool as a regular session (just flagged with
+    // `VCL_SESSION_F_IS_VEP`); `vcl_session_cleanup` checks that
+    // flag and uses the VEP-specific teardown path. So
+    // `vppcom_session_close(vep)` is the correct, documented way
+    // to free an epoll handle — verified against VPP source on
+    // 2026-05-08.
+    let vep = unsafe { crate::ffi::vppcom_epoll_create() };
     if vep < 0 {
-        return Err(VclError::Api(format!("vls_epoll_create: {vep}"), vep));
+        return Err(VclError::Api(format!("vppcom_epoll_create: {vep}"), vep));
     }
+    let vep = vep as u32;
     let mut ev = crate::ffi::epoll_event {
         events: crate::ffi::EPOLLIN
             | crate::ffi::EPOLLOUT
@@ -60,19 +66,19 @@ pub(crate) fn verify_bind_or_err(session: u32, requested: SocketAddr) -> Result<
         data: u64::from(session),
     };
     let rv = unsafe {
-        crate::ffi::vls_epoll_ctl(vep, crate::ffi::EPOLL_CTL_ADD, session as crate::ffi::vls_handle_t, &mut ev)
+        crate::ffi::vppcom_epoll_ctl(vep, crate::ffi::EPOLL_CTL_ADD, session, &mut ev)
     };
     if rv < 0 {
         unsafe {
-            crate::ffi::vls_close(vep);
+            crate::ffi::vppcom_session_close(vep);
         }
-        return Err(VclError::Api(format!("vls_epoll_ctl ADD: {rv}"), rv));
+        return Err(VclError::Api(format!("vppcom_epoll_ctl ADD: {rv}"), rv));
     }
     let mut events = [crate::ffi::epoll_event { events: 0, data: 0 }; 8];
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
     while std::time::Instant::now() < deadline {
         unsafe {
-            crate::ffi::vls_epoll_wait(
+            crate::ffi::vppcom_epoll_wait(
                 vep,
                 events.as_mut_ptr(),
                 events.len() as i32,
@@ -81,7 +87,7 @@ pub(crate) fn verify_bind_or_err(session: u32, requested: SocketAddr) -> Result<
         }
     }
     unsafe {
-        crate::ffi::vls_close(vep);
+        crate::ffi::vppcom_session_close(vep);
     }
 
     // After the drain, confirm the session is still queryable. If
@@ -437,22 +443,23 @@ pub fn query_tcp_dns_sync(
     // though VPP's TCP stack already finished the handshake. Use a
     // per-call epoll set with `vppcom_epoll_wait` to drain MQ events
     // (and block briefly on the actual eventfd) instead of sleep.
-    let vep = unsafe { crate::ffi::vls_epoll_create() };
+    let vep = unsafe { crate::ffi::vppcom_epoll_create() };
     if vep < 0 {
-        return Err(VclError::Api(format!("vls_epoll_create: {}", vep), vep));
+        return Err(VclError::Api(format!("vppcom_epoll_create: {}", vep), vep));
     }
+    let vep = vep as u32;
     let mut ev = crate::ffi::epoll_event {
         events: crate::ffi::EPOLLIN | crate::ffi::EPOLLOUT | crate::ffi::EPOLLET,
         data: u64::from(handle.0),
     };
     let rv = unsafe {
-        crate::ffi::vls_epoll_ctl(vep, crate::ffi::EPOLL_CTL_ADD, handle.0 as crate::ffi::vls_handle_t, &mut ev)
+        crate::ffi::vppcom_epoll_ctl(vep, crate::ffi::EPOLL_CTL_ADD, handle.0, &mut ev)
     };
     if rv < 0 {
         unsafe {
-            crate::ffi::vls_close(vep);
+            crate::ffi::vppcom_session_close(vep);
         }
-        return Err(VclError::Api(format!("vls_epoll_ctl ADD: {}", rv), rv));
+        return Err(VclError::Api(format!("vppcom_epoll_ctl ADD: {}", rv), rv));
     }
     // Drain the MQ for up to `wait_ms` milliseconds, returning whether
     // any events fired. Used between write/read polls instead of
@@ -460,7 +467,7 @@ pub fn query_tcp_dns_sync(
     let drain_mq = |wait_ms: f64| {
         let mut events = [crate::ffi::epoll_event { events: 0, data: 0 }; 4];
         unsafe {
-            crate::ffi::vls_epoll_wait(
+            crate::ffi::vppcom_epoll_wait(
                 vep,
                 events.as_mut_ptr(),
                 events.len() as i32,
@@ -470,14 +477,15 @@ pub fn query_tcp_dns_sync(
     };
 
     // RAII cleanup so we close `vep` on every return path below.
-    // `vls_close` is the right call — VLS keeps epoll handles in
-    // its pool keyed by `vls_handle_t`, same dispatch pattern as
-    // sessions.
-    struct EpollGuard(crate::ffi::vls_handle_t);
+    // `vppcom_session_close` is the right call — see the long
+    // comment in `verify_bind_or_err` above; VCL stores epoll
+    // handles in the same pool as sessions and dispatches on
+    // `VCL_SESSION_F_IS_VEP`.
+    struct EpollGuard(u32);
     impl Drop for EpollGuard {
         fn drop(&mut self) {
             unsafe {
-                crate::ffi::vls_close(self.0);
+                crate::ffi::vppcom_session_close(self.0);
             }
         }
     }
