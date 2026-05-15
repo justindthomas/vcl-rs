@@ -110,33 +110,28 @@ impl VclReactor {
         let weak_mq = Arc::downgrade(&reactor.mq_fd);
         tokio::spawn(async move {
             // Periodic forced-progress task. The `has_event`-stall
-            // workaround is bounded by this interval.
+            // workaround — and, in practice, the dominant source of
+            // upstream-response latency, because VPP's cross-worker
+            // MQ event delivery is unreliable enough that the demux
+            // frequently relies on this tick rather than a real
+            // event.
             //
-            // Tick is a compromise: tighter intervals respond faster
-            // to a wedged session but multiply lock-contention cost
-            // because each tick acquires `reactor.inner.lock()` and
-            // iterates `notify_one` over every entry in the waiters
-            // map. Under sustained DoH load with thousands of
-            // accumulated half-handshaked sessions, a 10ms tick
-            // produced enough contention with `wait_event` /
-            // `register` / `deregister` that the runtime livelocked
-            // overnight on jt-router (FIFOs filled, control socket
-            // stopped responding). 50ms restores headroom while
-            // still bounding the worst-case wedge to a typical
-            // resolver retry window.
-            // 500ms tick. Each spurious notify wakes every parked
-            // task; each waking task that calls `vppcom_session_read`
-            // pays a ~1ms blocking call inside libvppcom (the
-            // `svm_msg_q_timedwait(timeout=1)` MQ-drain — visible
-            // in gdb backtraces of stuck states). With ~10 active
-            // TLS sessions and a 50ms tick, that's ~10×1×20 = 200ms
-            // of wall-time per second spent inside libvppcom doing
-            // nothing useful, which starves the UDP listener and
-            // the drainer's own tick out of CPU. 500ms keeps the
-            // worst-case `has_event` stall bounded to a typical
-            // resolver retry window while cutting the spurious-wake
-            // overhead by 10x.
-            let mut tick = tokio::time::interval(Duration::from_millis(500));
+            // History: a 10 ms tick once livelocked dnsd overnight,
+            // but that was under the VLS port, where every reactor
+            // in the process shared one VLS lock — N reactors each
+            // ticking 10 ms compounded into lock thrash. Post-VLS,
+            // each vcl-io worker has a fully independent reactor
+            // (own MQ, own `__vcl_worker_index`, own waiters map);
+            // a 10 ms tick here only wakes this one worker's ~3
+            // waiters and touches only this worker's `inner` mutex.
+            // No cross-worker contention exists to compound.
+            //
+            // At 500 ms the average drain latency was ~250 ms per
+            // upstream hop; a 10-hop recursive walk inherited
+            // multiple seconds of pure tick-wait. At 10 ms that
+            // drops to ~5 ms/hop — walk latency becomes dominated by
+            // real network RTT again, which is the point.
+            let mut tick = tokio::time::interval(Duration::from_millis(10));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut last_alive = tokio::time::Instant::now();
             loop {
