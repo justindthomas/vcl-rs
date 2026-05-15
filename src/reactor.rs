@@ -138,42 +138,30 @@ impl VclReactor {
 
         let deadline = tokio::time::Instant::now() + timeout;
 
-        // Race two wake sources concurrently with `biased select!`:
-        //
-        //   - `notify.notified()` — the per-session Notify is set
-        //     by `drain_events`. Drain can run from ANY task currently
-        //     in wait_event (mq_fd is shared across all sessions),
-        //     so a stash from another task's drain might have
-        //     already deposited a permit for us BEFORE we entered
-        //     this loop. Checking it first makes that permit
-        //     reachable without first waiting on an mq_fd edge
-        //     that may never come.
-        //   - `mq_fd.readable()` — a fresh VCL event signal. When it
-        //     fires we drain and either find our session's event
-        //     (and notify_one ourselves on the next loop iter
-        //     consumes the permit) or someone else's (notified for
-        //     them, loop again).
-        //
-        // The `biased` keyword ensures the notified() branch is
-        // polled first each round — small but important when both
-        // are immediately ready.
         loop {
-            tokio::select! {
-                biased;
-                _ = notify.notified() => return Ok(()),
-                ready_result = tokio::time::timeout_at(
-                    deadline,
-                    self.mq_fd.readable(),
-                ) => {
-                    let mut ready = ready_result
-                        .map_err(|_| VclError::Timeout)?
-                        .map_err(VclError::Io)?;
-                    self.drain_events();
-                    ready.clear_ready();
-                    // Loop back; the biased notified() branch will
-                    // resolve in the next iteration if drain just
-                    // stashed our permit.
-                }
+            // Wait for the MQ fd to become readable (VCL has events).
+            let mut ready = tokio::time::timeout_at(
+                deadline,
+                self.mq_fd.readable(),
+            )
+            .await
+            .map_err(|_| VclError::Timeout)?
+            .map_err(|e| VclError::Io(e))?;
+
+            // Drain VCL events and notify waiters.
+            self.drain_events();
+
+            // Clear the AsyncFd readiness so we re-arm for next time.
+            ready.clear_ready();
+
+            // Check if our session was notified. Use a zero-duration
+            // check — if the notification arrived, proceed; if not,
+            // loop and wait for the next MQ event.
+            if tokio::time::timeout(Duration::from_millis(0), notify.notified())
+                .await
+                .is_ok()
+            {
+                return Ok(());
             }
         }
     }
