@@ -191,7 +191,11 @@ impl VclStream {
             match self.handle.read(buf) {
                 Ok(0) => return Err(VclError::Closed),
                 Ok(n) => return Ok(n),
-                Err(VclError::WouldBlock) => {
+                // `NotConnected` means the TCP handshake hasn't
+                // finished yet (VPP session still in state CONNECT);
+                // it is retryable exactly like `WouldBlock` — wait
+                // for the session to become ready and try again.
+                Err(VclError::WouldBlock | VclError::NotConnected) => {
                     self.reactor
                         .wait_readable(self.handle.0, Duration::from_secs(300))
                         .await?;
@@ -219,7 +223,9 @@ impl VclStream {
         while pos < buf.len() {
             match self.handle.write(&buf[pos..]) {
                 Ok(n) => pos += n,
-                Err(VclError::WouldBlock) => {
+                // See `read`: `NotConnected` is the handshake-still-
+                // in-progress case and is retryable like `WouldBlock`.
+                Err(VclError::WouldBlock | VclError::NotConnected) => {
                     self.reactor
                         .wait_writable(self.handle.0, Duration::from_secs(300))
                         .await?;
@@ -311,7 +317,14 @@ impl AsyncRead for VclStream {
                     buf.advance(n);
                     return Poll::Ready(Ok(()));
                 }
-                Err(VclError::WouldBlock) => {
+                // `NotConnected` (handshake still in progress) is
+                // retryable just like `WouldBlock`: `connect_async`
+                // can return before the 3-way handshake fully
+                // completes, so the first read/write a poll-loop
+                // caller (tokio-rustls, hyper, …) issues may land
+                // in state CONNECT. Park on the reactor and retry —
+                // never surface it as a fatal io::Error.
+                Err(VclError::WouldBlock | VclError::NotConnected) => {
                     let reactor = this.reactor.clone();
                     let handle_id = this.handle.0;
                     this.pending_readable = Some(Box::pin(async move {
@@ -353,7 +366,10 @@ impl AsyncWrite for VclStream {
 
             match this.handle.write(buf) {
                 Ok(n) => return Poll::Ready(Ok(n)),
-                Err(VclError::WouldBlock) => {
+                // See `poll_read`: `NotConnected` is the handshake-
+                // still-in-progress case and must be retried, not
+                // surfaced as a fatal error.
+                Err(VclError::WouldBlock | VclError::NotConnected) => {
                     let reactor = this.reactor.clone();
                     let handle_id = this.handle.0;
                     this.pending_writable = Some(Box::pin(async move {
