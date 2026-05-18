@@ -64,6 +64,10 @@ impl SessionHandle {
         if rc < 0 {
             return Err(VclError::from_rc(rc));
         }
+        // For a cut-through (same-VPP app-to-app) session the peer
+        // endpoint comes back unspecified — there is no IP 5-tuple.
+        // That is faithful, not an error; callers distinguish it with
+        // `SocketAddr::ip().is_unspecified()`.
         let addr = addr_from_endpoint(&ep, &ip_buf);
         Ok((SessionHandle(rc as u32), addr))
     }
