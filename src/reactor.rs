@@ -51,6 +51,15 @@ use tokio::sync::Notify;
 use crate::error::{Result, VclError};
 use crate::ffi;
 
+/// The periodic-drain task ticks every 10 ms. If two consecutive
+/// ticks land more than this far apart, the worker thread (or its
+/// whole current-thread runtime) was blocked in between — almost
+/// always parked in a blocking libvppcom call — and every query in
+/// flight on that worker stalled with it. The threshold sits well
+/// above normal single-thread scheduler jitter so the warning only
+/// fires on a genuine stall.
+const REACTOR_STALL_THRESHOLD: Duration = Duration::from_millis(500);
+
 struct ReactorInner {
     /// VCL epoll handle (from vppcom_epoll_create).
     vep: u32,
@@ -133,9 +142,35 @@ impl VclReactor {
             // real network RTT again, which is the point.
             let mut tick = tokio::time::interval(Duration::from_millis(10));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // This task is spawned on — and pinned to — the vcl-io
+            // worker's current-thread runtime, so the running thread's
+            // name identifies which worker stalled.
+            let worker = std::thread::current()
+                .name()
+                .map(str::to_owned)
+                .unwrap_or_else(|| "?".to_owned());
             let mut last_alive = tokio::time::Instant::now();
+            let mut prev_tick = last_alive;
             loop {
                 tick.tick().await;
+                // Stall watch. `tokio::time::Instant` reads the real
+                // monotonic clock, so even though the tokio timer is
+                // frozen while the worker is blocked, the gap measured
+                // here is true wall-clock time. A blocked worker can't
+                // log while wedged — this fires on resume, making the
+                // stall (and its duration) visible after the fact.
+                let now = tokio::time::Instant::now();
+                let gap = now.duration_since(prev_tick);
+                prev_tick = now;
+                if gap >= REACTOR_STALL_THRESHOLD {
+                    tracing::warn!(
+                        worker = %worker,
+                        stalled_ms = gap.as_millis() as u64,
+                        "VclReactor tick stalled — worker thread was blocked \
+                         (likely a blocking libvppcom op); queries in flight \
+                         on this worker hung for that long",
+                    );
+                }
                 let (Some(inner), Some(_keepalive_mq)) =
                     (weak_inner.upgrade(), weak_mq.upgrade())
                 else {
