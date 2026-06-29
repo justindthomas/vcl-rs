@@ -289,3 +289,29 @@ fn addr_from_endpoint(ep: &ffi::vppcom_endpt_t, ip_buf: &[u8; 16]) -> SocketAddr
         SocketAddr::new(IpAddr::V6(Ipv6Addr::from(*ip_buf)), port)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(addr: SocketAddr, want_is_ip4: u8) {
+        let mut ip_buf = [0u8; 16];
+        let ep = endpoint_into_buf(addr, &mut ip_buf);
+        assert_eq!(ep.is_ip4, want_is_ip4, "is_ip4 flag for {addr}");
+        // Port rides the wire big-endian.
+        assert_eq!(ep.port, addr.port().to_be(), "BE port for {addr}");
+        let back = addr_from_endpoint(&ep, &ip_buf);
+        assert_eq!(back, addr, "endpoint round-trip for {addr}");
+    }
+
+    #[test]
+    fn endpoint_roundtrips_v4_and_v6() {
+        // A wrong is_ip4 flag, mis-sized address copy, or byte-swapped
+        // port silently sends datagrams to the wrong host (or a port-0
+        // packet upstreams drop). Pin the marshalling both directions.
+        roundtrip("192.0.2.7:179".parse().unwrap(), 1);
+        roundtrip("[2001:db8::1]:53".parse().unwrap(), 0);
+        // High port exercises both big-endian bytes.
+        roundtrip("203.0.113.9:65000".parse().unwrap(), 1);
+    }
+}

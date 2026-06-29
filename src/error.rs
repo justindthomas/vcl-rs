@@ -51,3 +51,32 @@ fn vcl_retval_str(rc: i32) -> String {
 }
 
 pub type Result<T> = std::result::Result<T, VclError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_rc_classifies_retryable_vs_terminal() {
+        // The poll loop branches on these: EWOULDBLOCK/EAGAIN/EINPROGRESS
+        // and (per the doc note) ENOTCONN must read as "keep polling",
+        // while ECONNRESET/EPIPE mean the peer is gone. A misclassification
+        // here either spins forever or declares EOF mid-handshake.
+        for rc in [-libc::EWOULDBLOCK, -libc::EAGAIN, -libc::EINPROGRESS] {
+            assert!(
+                matches!(VclError::from_rc(rc), VclError::WouldBlock),
+                "rc {rc} should be WouldBlock"
+            );
+        }
+        assert!(matches!(
+            VclError::from_rc(-libc::ENOTCONN),
+            VclError::NotConnected
+        ));
+        for rc in [-libc::ECONNRESET, -libc::EPIPE] {
+            assert!(
+                matches!(VclError::from_rc(rc), VclError::Closed),
+                "rc {rc} should be Closed"
+            );
+        }
+    }
+}
